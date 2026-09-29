@@ -21,6 +21,7 @@ Usage:
     trainer.train()
 """
 
+import contextlib
 import itertools
 import logging
 import math
@@ -171,6 +172,88 @@ class OpenWAMTrainer:
         is_main = self.accelerator is None or self.accelerator.is_main_process
         log_parameter_counts(self.architecture, is_main=is_main)
 
+    def _build_profiler(self, output_path: str):
+        """Construct torch.profiler.profile context manager controlled via environment variables.
+
+        Configuration:
+          - enable_profiling=true (or 1, on, yes): enables profiling.
+          - Default profiles rank 0 only. To profile all ranks:
+              enable_profiling=all, or profiling_all_ranks=true (PROFILING_ALL_RANKS=true).
+          - PROFILING_WAIT (default: 15)
+          - PROFILING_WARMUP (default: 0)
+          - PROFILING_ACTIVE (default: 1)
+          - PROFILING_REPEAT (default: 1)
+          - PROFILING_MEMORY (default: false)
+          - PROFILING_RECORD_SHAPES (default: true)
+          - PROFILING_WITH_STACK (default: true)
+          - PROFILING_DIR (default: <output_path>/profiler_traces)
+        """
+        raw_val = (os.environ.get("enable_profiling") or os.environ.get("ENABLE_PROFILING", "")).strip().lower()
+        enable_prof = raw_val in ("true", "1", "all", "yes", "on")
+        if not enable_prof:
+            return contextlib.nullcontext()
+
+        all_ranks = (
+            raw_val == "all"
+            or os.environ.get("profiling_all_ranks", "").strip().lower() in ("true", "1", "yes", "on")
+            or os.environ.get("PROFILING_ALL_RANKS", "").strip().lower() in ("true", "1", "yes", "on")
+        )
+        if not all_ranks and self._rank != 0:
+            return contextlib.nullcontext()
+
+        wait_steps = int(os.environ.get("PROFILING_WAIT", "15"))
+        warmup_steps = int(os.environ.get("PROFILING_WARMUP", "0"))
+        active_steps = int(os.environ.get("PROFILING_ACTIVE", "1"))
+        repeat_steps = int(os.environ.get("PROFILING_REPEAT", "1"))
+        profile_memory = os.environ.get("PROFILING_MEMORY", "false").strip().lower() in ("true", "1", "yes", "on")
+        record_shapes = os.environ.get("PROFILING_RECORD_SHAPES", "true").strip().lower() in ("true", "1", "yes", "on")
+        with_stack = os.environ.get("PROFILING_WITH_STACK", "true").strip().lower() in ("true", "1", "yes", "on")
+
+        trace_dir = os.environ.get("PROFILING_DIR") or os.path.join(output_path, "profiler_traces")
+        os.makedirs(trace_dir, exist_ok=True)
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        schedule = torch.profiler.schedule(
+            wait=wait_steps,
+            warmup=warmup_steps,
+            active=active_steps,
+            repeat=repeat_steps,
+        )
+
+        tb_handler = torch.profiler.tensorboard_trace_handler(
+            trace_dir,
+            worker_name=f"rank_{self._rank}",
+        )
+
+        def _on_trace_ready(prof_inst):
+            tb_handler(prof_inst)
+            logger.info("[PROFILER] Trace saved for rank %d in %s", self._rank, trace_dir)
+            if self._rank == 0:
+                print(f"\n[PROFILER] PyTorch Profiler trace saved to: {trace_dir}\n", flush=True)
+
+        logger.info(
+            "[PROFILER] Profiling active on rank %d: wait=%d, warmup=%d, active=%d, repeat=%d, memory=%s, dir=%s",
+            self._rank,
+            wait_steps,
+            warmup_steps,
+            active_steps,
+            repeat_steps,
+            profile_memory,
+            trace_dir,
+        )
+
+        return torch.profiler.profile(
+            activities=activities,
+            schedule=schedule,
+            on_trace_ready=_on_trace_ready,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+        )
+
     # (2) Driver — build optimizer/dataloader/scheduler -> setup dir -> accelerate prepare
     #     -> (resume) -> epoch/step loop{compute_loss -> log_step -> save} -> finish_training.
     def train(self, num_epochs: int = None, max_steps: int = None):
@@ -299,80 +382,84 @@ class OpenWAMTrainer:
         # reproducible across runs and ZeRO stages: same (rank, step) -> same RNG,
         # different ranks at the same step keep in-batch timestep diversity.
         # Gated on _run_seed so unseeded production runs stay fully stochastic.
-        epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
-        for epoch in epochs:
-            if hasattr(dataloader, "set_epoch"):
-                dataloader.set_epoch(epoch)
-            if hasattr(self.dataset, "set_epoch"):
-                self.dataset.set_epoch(epoch)
-            # On the resumed epoch, skip the batches already consumed before the checkpoint.
-            if epoch == start_epoch and skip_first > 0:
-                from accelerate import skip_first_batches
+        prof_context = self._build_profiler(output_path)
+        with prof_context as prof:
+            epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
+            for epoch in epochs:
+                if hasattr(dataloader, "set_epoch"):
+                    dataloader.set_epoch(epoch)
+                if hasattr(self.dataset, "set_epoch"):
+                    self.dataset.set_epoch(epoch)
+                # On the resumed epoch, skip the batches already consumed before the checkpoint.
+                if epoch == start_epoch and skip_first > 0:
+                    from accelerate import skip_first_batches
 
-                epoch_iter = skip_first_batches(dataloader, skip_first)
-            else:
-                epoch_iter = dataloader
-            for batch in epoch_iter:
-                if self._run_seed is not None:
-                    step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
-                    torch.manual_seed(step_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(step_seed)
-                with self.accelerator.accumulate(self.architecture):
-                    losses = self.compute_loss(batch)
-                    loss = losses["total"]
-                    self.accelerator.backward(loss)
+                    epoch_iter = skip_first_batches(dataloader, skip_first)
+                else:
+                    epoch_iter = dataloader
+                for batch in epoch_iter:
+                    if self._run_seed is not None:
+                        step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
+                        torch.manual_seed(step_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(step_seed)
+                    with self.accelerator.accumulate(self.architecture):
+                        losses = self.compute_loss(batch)
+                        loss = losses["total"]
+                        self.accelerator.backward(loss)
 
-                    grad_norm = torch.tensor(0.0, device=loss.device)
-                    if self.accelerator.sync_gradients:
-                        if max_grad_norm is not None:
-                            grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
-                            grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
-                        optimizer.step()
-                        if scheduler is not None:
-                            scheduler.step()
-                        optimizer.zero_grad()
-                        opt_step += 1
+                        grad_norm = torch.tensor(0.0, device=loss.device)
+                        if self.accelerator.sync_gradients:
+                            if max_grad_norm is not None:
+                                grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
+                                grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
+                            optimizer.step()
+                            if scheduler is not None:
+                                scheduler.step()
+                            optimizer.zero_grad()
+                            opt_step += 1
 
-                global_step += 1
+                    global_step += 1
+                    if prof is not None:
+                        prof.step()
 
-                metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                    metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
 
-                current_lr = optimizer.param_groups[0]["lr"]
-                _now = _time.monotonic()
-                steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
-                _step_t0 = _now
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    _now = _time.monotonic()
+                    steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
+                    _step_t0 = _now
 
-                self.log_step(
-                    metrics=metrics,
-                    global_step=global_step,
-                    opt_step=opt_step,
-                    epoch=epoch,
-                    lr=current_lr,
-                    steps_per_sec=steps_per_sec,
-                    batch_size=batch_size,
-                    pbar=pbar,
-                    wandb_run=wandb_run,
-                    debug=debug,
-                    output_path=output_path,
-                )
+                    self.log_step(
+                        metrics=metrics,
+                        global_step=global_step,
+                        opt_step=opt_step,
+                        epoch=epoch,
+                        lr=current_lr,
+                        steps_per_sec=steps_per_sec,
+                        batch_size=batch_size,
+                        pbar=pbar,
+                        wandb_run=wandb_run,
+                        debug=debug,
+                        output_path=output_path,
+                    )
 
-                # save_steps: write the weights line (+ the resumable full state when
-                # save_full_states_for_resume=true), then prune in lockstep.
-                if save_steps and global_step > 0 and global_step % save_steps == 0:
-                    save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
-                    if save_full_states_for_resume:
-                        save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
-                    if is_main:
-                        manage_checkpoints(output_path, keep_last_k)
+                    # save_steps: write the weights line (+ the resumable full state when
+                    # save_full_states_for_resume=true), then prune in lockstep.
+                    if save_steps and global_step > 0 and global_step % save_steps == 0:
+                        save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
+                        if save_full_states_for_resume:
+                            save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
+                        if is_main:
+                            manage_checkpoints(output_path, keep_last_k)
 
-                if max_steps and global_step >= max_steps:
-                    pbar.close()
-                    self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
-                    return
+                    if max_steps and global_step >= max_steps:
+                        pbar.close()
+                        self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
+                        return
 
-        pbar.close()
-        self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
+            pbar.close()
+            self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
 
     # (3) Called by train() first — AdamW over the per-module (action/video) LR param groups.
     def build_optimizer(self) -> torch.optim.Optimizer:
