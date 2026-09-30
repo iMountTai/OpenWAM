@@ -22,10 +22,13 @@ Usage:
 """
 
 import contextlib
+import gzip
 import itertools
+import json
 import logging
 import math
 import os
+import time
 
 import torch
 from omegaconf import DictConfig
@@ -173,86 +176,96 @@ class OpenWAMTrainer:
         log_parameter_counts(self.architecture, is_main=is_main)
 
     def _build_profiler(self, output_path: str):
-        """Construct torch.profiler.profile context manager controlled via environment variables.
+        """Construct torch.profiler.profile context manager matching DiffSynth-Studio design.
 
-        Configuration:
-          - enable_profiling=true (or 1, on, yes): enables profiling.
-          - Default profiles rank 0 only. To profile all ranks:
-              enable_profiling=all, or profiling_all_ranks=true (PROFILING_ALL_RANKS=true).
-          - PROFILING_WAIT (default: 15)
-          - PROFILING_WARMUP (default: 0)
-          - PROFILING_ACTIVE (default: 1)
-          - PROFILING_REPEAT (default: 1)
-          - PROFILING_MEMORY (default: false)
-          - PROFILING_RECORD_SHAPES (default: true)
-          - PROFILING_WITH_STACK (default: true)
-          - PROFILING_DIR (default: <output_path>/profiler_traces)
+        Controlled cleanly by single environment variable:
+          - enable_profiling=true (or 1): profiles rank 0 (wait=15, warmup=0, active=1, repeat=1).
+          - enable_profiling=all:        profiles all ranks.
+
+        Defaults aligned with DiffSynth-Studio:
+          with_stack=False, record_shapes=False, profile_memory=False, with_modules=False.
+        Saves compressed trace directly to:
+          <output_path>/profiler_traces/rank{rank}_trace.json.gz
         """
         raw_val = (os.environ.get("enable_profiling") or os.environ.get("ENABLE_PROFILING", "")).strip().lower()
-        enable_prof = raw_val in ("true", "1", "all", "yes", "on")
-        if not enable_prof:
+        if raw_val not in ("true", "1", "all", "yes", "on"):
             return contextlib.nullcontext()
 
-        all_ranks = (
-            raw_val == "all"
-            or os.environ.get("profiling_all_ranks", "").strip().lower() in ("true", "1", "yes", "on")
-            or os.environ.get("PROFILING_ALL_RANKS", "").strip().lower() in ("true", "1", "yes", "on")
-        )
-        if not all_ranks and self._rank != 0:
+        if raw_val != "all" and self._rank != 0:
             return contextlib.nullcontext()
 
-        wait_steps = int(os.environ.get("PROFILING_WAIT", "15"))
-        warmup_steps = int(os.environ.get("PROFILING_WARMUP", "0"))
-        active_steps = int(os.environ.get("PROFILING_ACTIVE", "1"))
-        repeat_steps = int(os.environ.get("PROFILING_REPEAT", "1"))
-        profile_memory = os.environ.get("PROFILING_MEMORY", "false").strip().lower() in ("true", "1", "yes", "on")
-        record_shapes = os.environ.get("PROFILING_RECORD_SHAPES", "true").strip().lower() in ("true", "1", "yes", "on")
-        with_stack = os.environ.get("PROFILING_WITH_STACK", "true").strip().lower() in ("true", "1", "yes", "on")
-
-        trace_dir = os.environ.get("PROFILING_DIR") or os.path.join(output_path, "profiler_traces")
+        trace_dir = os.path.join(output_path, "profiler_traces")
         os.makedirs(trace_dir, exist_ok=True)
 
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        schedule = torch.profiler.schedule(
-            wait=wait_steps,
-            warmup=warmup_steps,
-            active=active_steps,
-            repeat=repeat_steps,
-        )
+        def _sanitize_trace(trace_path: str):
+            """Ensure GPU streams and CPU threads remain strictly segregated (泾渭分明).
 
-        tb_handler = torch.profiler.tensorboard_trace_handler(
-            trace_dir,
-            worker_name=f"rank_{self._rank}",
-        )
+            Fixes ROCm/DCU Kineto quirk where unmapped background threads (DataLoader
+            queues/Inductor pool) during initialization fall back to (pid 0, tid 0),
+            which would otherwise rename GPU Stream 0 to 'thread 0 (python3)' and merge
+            Python call stacks into the GPU stream track.
+            """
+            try:
+                open_fn = gzip.open if trace_path.endswith(".gz") else open
+                with open_fn(trace_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
 
-        def _on_trace_ready(prof_inst):
-            tb_handler(prof_inst)
-            logger.info("[PROFILER] Trace saved for rank %d in %s", self._rank, trace_dir)
+                events = data.get("traceEvents", [])
+                cpu_pid = None
+                for e in events:
+                    if e.get("name") == "process_labels" and e.get("args", {}).get("labels") == "CPU":
+                        cpu_pid = e.get("pid")
+                        break
+
+                modified = False
+                for e in events:
+                    if e.get("pid") == 0 and e.get("cat") == "python_function":
+                        if cpu_pid is not None:
+                            e["pid"] = cpu_pid
+                        modified = True
+                    elif e.get("ph") == "M" and e.get("pid") == 0 and e.get("tid") == 0 and e.get("name") == "thread_name":
+                        if "thread" in e.get("args", {}).get("name", "").lower():
+                            e["args"]["name"] = "stream 0 "
+                            modified = True
+
+                if modified:
+                    with open_fn(trace_path, "wt", encoding="utf-8") as f:
+                        json.dump(data, f)
+            except Exception as err:
+                logger.warning("[PROFILER] Trace sanitize warning: %s", err)
+
+        def trace_handler(prof_inst):
+            step_tag = f"_step{prof_inst.step_num}" if hasattr(prof_inst, "step_num") else ""
+            trace_path = os.path.join(trace_dir, f"rank{self._rank}{step_tag}_trace.json.gz")
+            t0 = time.monotonic()
+            prof_inst.export_chrome_trace(trace_path)
+            _sanitize_trace(trace_path)
+            duration = time.monotonic() - t0
+            msg = f"[PROFILER] Rank {self._rank} exported trace to `{trace_path}` in {duration:.2f}s."
+            logger.info(msg)
             if self._rank == 0:
-                print(f"\n[PROFILER] PyTorch Profiler trace saved to: {trace_dir}\n", flush=True)
+                print(f"\n{msg}\n", flush=True)
 
         logger.info(
-            "[PROFILER] Profiling active on rank %d: wait=%d, warmup=%d, active=%d, repeat=%d, memory=%s, dir=%s",
+            "[PROFILER] Profiler enabled on rank %d (wait=15, warmup=0, active=1, with_stack=True, record_shapes=True, traces=`%s`)",
             self._rank,
-            wait_steps,
-            warmup_steps,
-            active_steps,
-            repeat_steps,
-            profile_memory,
             trace_dir,
         )
 
         return torch.profiler.profile(
             activities=activities,
-            schedule=schedule,
-            on_trace_ready=_on_trace_ready,
-            record_shapes=record_shapes,
-            profile_memory=profile_memory,
-            with_stack=with_stack,
+            schedule=torch.profiler.schedule(wait=15, warmup=0, active=1, repeat=1),
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True,
+            with_modules=False,
         )
+
 
     # (2) Driver — build optimizer/dataloader/scheduler -> setup dir -> accelerate prepare
     #     -> (resume) -> epoch/step loop{compute_loss -> log_step -> save} -> finish_training.
