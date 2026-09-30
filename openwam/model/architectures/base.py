@@ -674,6 +674,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             state_dict = self.state_dict()
         state_dict = _exclude_vlm_from_state_dict(state_dict)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # Safetensors requires dense contiguous tensors. Channels-last VAE
+        # parameters retain their logical shape and values in the checkpoint.
+        state_dict = {name: tensor.contiguous() for name, tensor in state_dict.items()}
         save_file(state_dict, path)
 
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
@@ -1087,6 +1090,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # --- Sample video timesteps ---
         video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
+        from openwam.optimizations import enabled, stage_training_indices
+
+        if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+            # Keep the CPU RNG sampling sequence unchanged, then move indices
+            # before the forward/backward region instead of at loss weighting.
+            video_timestep_ids = stage_training_indices(video_timestep_ids, _device)
 
         video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
         video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
@@ -1111,6 +1120,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
         if lambda_action > 0 and actions is not None:
             action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
+            if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+                action_timestep_ids = stage_training_indices(action_timestep_ids, _device)
 
             action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)
             action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=_dtype, device=_device)

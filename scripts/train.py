@@ -82,6 +82,9 @@ def _build_accelerator(cfg: DictConfig):
         gradient_clipping=float(max_grad_norm) if max_grad_norm else 0.0,
         offload_optimizer_device=str(t.offload_optimizer_device),
     )
+    from openwam.optimizations import configure_zero
+
+    configure_zero(plugin.deepspeed_config)
 
     return accelerate.Accelerator(
         gradient_accumulation_steps=grad_accum,
@@ -162,6 +165,9 @@ def main(cfg: DictConfig) -> None:
         builtins.print = lambda *a, **kw: None
 
     sys.path.insert(0, str(PROJECT_ROOT))
+    from openwam.optimizations import configure_backends
+
+    configure_backends()
 
     try:
         _train(cfg)

@@ -8,6 +8,8 @@ from einops import rearrange
 
 from openwam.model.video_backbone.wan.camera_controller import SimpleAdapter
 from openwam.model.video_backbone.wan.shared.core.gradient import gradient_checkpoint_forward
+from openwam.optimizations import enabled, pointwise
+from openwam.optimizations.attention import fa2_padding
 
 try:
     import flash_attn_interface
@@ -52,6 +54,10 @@ def flash_attention(
 ):
     # FA2/FA3/sage are CUDA half-precision kernels; they raise on anything else.
     fused_ok = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
+    if not compatibility_mode:
+        padded = fa2_padding(q, k, v, attn_mask, num_heads)
+        if padded is not None:
+            return padded
     if compatibility_mode or attn_mask is not None or not fused_ok:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -88,6 +94,8 @@ def flash_attention(
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+    if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+        return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
 
@@ -118,6 +126,8 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    if enabled("OPENWAM_OPT_ROPE_FP32") or enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+        return pointwise.rotate(x, freqs).flatten(2)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
@@ -133,6 +143,8 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+            return pointwise.rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
 
@@ -221,6 +233,8 @@ class GateModule(nn.Module):
         super().__init__()
 
     def forward(self, x, gate, residual):
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+            return pointwise.gate(x, gate, residual)
         return x + gate * residual
 
 

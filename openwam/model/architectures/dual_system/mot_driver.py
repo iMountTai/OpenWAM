@@ -28,6 +28,8 @@ from openwam.model.architectures.utils.mask_modes import (
     validate_attention_mask_mode,
     widen_mask_for_prefix_kv,
 )
+from openwam.optimizations import enabled
+from openwam.optimizations.attention import split_attention, split_mask_plan
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
@@ -113,14 +115,25 @@ class DualSystemMoTDriver:
         ``vb.video_attention_mask_mode``; ``a↔a`` is fully connected; ``v↔a``
         follows ``attention_mask_mode`` (see :mod:`utils.mask_modes`).
         """
-        return build_cross_modal_attention_mask(
+        split_enabled = enabled("OPENWAM_OPT_MOT_SPLIT_ATTN")
+        mask = build_cross_modal_attention_mask(
             self.vb,
             s_video=s_video,
             s_action=s_action,
             video_tokens_per_frame=video_tokens_per_frame,
             mode=self.attention_mask_mode,
-            device=device,
+            device=torch.device("cpu") if split_enabled else device,
         )
+        plan = split_mask_plan(mask) if split_enabled else None
+        mask = mask.to(device=device)
+        if plan is not None:
+            try:
+                version = mask._version
+            except RuntimeError:  # Inference tensors have no version counter.
+                return mask
+            mask._openwam_split_plan = plan
+            mask._openwam_split_version = version
+        return mask
 
     def _mixed_attention(
         self,
@@ -135,6 +148,12 @@ class DualSystemMoTDriver:
         in both backbones). Output is the same layout. SDPA is used so an
         optional bool ``attn_mask`` (True = keep) can be honored.
         """
+        if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN"):
+            from openwam.model.video_backbone.wan.models.dit import flash_attention
+
+            out = split_attention(q_cat, k_cat, v_cat, attn_mask, self.num_heads, flash_attention)
+            if out is not None:
+                return out
         n = self.num_heads
         q = rearrange(q_cat, "b s (n d) -> b n s d", n=n)
         k = rearrange(k_cat, "b s (n d) -> b n s d", n=n)

@@ -33,6 +33,7 @@ import time
 import torch
 from omegaconf import DictConfig
 
+from openwam.optimizations import prepare_model, prepare_runtime_constants
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
     finalize_keep_weights_only,
@@ -153,6 +154,7 @@ class OpenWAMTrainer:
         freeze_list = list(getattr(m, "freeze", []))
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
+        prepare_model(self.architecture)
 
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
@@ -618,6 +620,7 @@ class OpenWAMTrainer:
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
+        prepare_runtime_constants(arch)
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,
