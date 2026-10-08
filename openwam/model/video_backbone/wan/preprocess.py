@@ -13,9 +13,6 @@ import torch
 from einops import reduce, repeat
 from PIL import Image
 
-from openwam.optimizations import enabled
-
-
 def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, max_value=1):
     """PIL.Image -> tensor in ``[min_value, max_value]`` on ``(dtype, device)``."""
     image = torch.Tensor(np.array(image, dtype=np.float32))
@@ -27,16 +24,6 @@ def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, m
 
 def preprocess_video(video, *, dtype, device, pattern="B C T H W", min_value=-1, max_value=1):
     """List[PIL.Image] -> stacked tensor along the ``T`` axis of ``pattern``."""
-    if enabled("OPENWAM_OPT_VIDEO_PREPROCESS") and pattern == "B C T H W":
-        # Preserve the original dtype conversion BEFORE normalization, including
-        # bf16 rounding. One transfer per clip replaces one transfer per frame.
-        array = np.stack([np.asarray(image, dtype=np.float32) for image in video])
-        tensor = torch.from_numpy(array).to(dtype=dtype)
-        if torch.device(device).type == "cuda":
-            tensor = tensor.pin_memory()
-        tensor = tensor.to(device=device, non_blocking=True)
-        tensor = tensor * ((max_value - min_value) / 255) + min_value
-        return tensor.permute(3, 0, 1, 2).unsqueeze(0)
     video = [
         preprocess_image(image, dtype=dtype, device=device, min_value=min_value, max_value=max_value) for image in video
     ]

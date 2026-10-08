@@ -92,6 +92,7 @@ class DualSystemMoTDriver:
         self.head_dim = vb.head_dim
         self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
         self.attention_mask_mode = attention_mask_mode
+        self._compiled_layer = None
 
         # Allow the architecture / config to override the video v↔v sub-mode.
         # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
@@ -215,6 +216,7 @@ class DualSystemMoTDriver:
         attn_mask: Optional[Tensor] = None,
         *,
         suppress_inner_attn_ckpt: bool = False,
+        _blocks=None,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Unwrapped per-layer body. See :meth:`step` for the public entry point.
 
@@ -233,8 +235,12 @@ class DualSystemMoTDriver:
         vb = self.vb
         ab = self.ab
 
-        q_v, k_v, v_v, vpost = vb.pre_attn_at_layer(layer_id, vstate)
-        q_a, k_a, v_a, apost = ab.pre_attn_at_layer(layer_id, astate)
+        if _blocks is None:
+            q_v, k_v, v_v, vpost = vb.pre_attn_at_layer(layer_id, vstate)
+            q_a, k_a, v_a, apost = ab.pre_attn_at_layer(layer_id, astate)
+        else:
+            q_v, k_v, v_v, vpost = vb.pre_attn_at_layer_for_compile(layer_id, vstate, block=_blocks[0])
+            q_a, k_a, v_a, apost = ab.pre_attn_at_layer_for_compile(layer_id, astate, block=_blocks[1])
 
         if q_v.dtype != q_a.dtype:
             raise RuntimeError(
@@ -261,11 +267,16 @@ class DualSystemMoTDriver:
                 self._mixed_attention, q_cat, k_cat, v_cat, attn_mask, use_reentrant=False
             )
         else:
-            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attn_mask)
+            attention = self._mixed_attention if _blocks is None else self._compiled_attention
+            mixed = attention(q_cat, k_cat, v_cat, attn_mask)
 
         attn_v, attn_a = mixed.split([s_video, s_action], dim=1)
-        vstate = vb.post_attn_at_layer(layer_id, vstate, attn_v.contiguous(), vpost)
-        astate = ab.post_attn_at_layer(layer_id, astate, attn_a.contiguous(), apost)
+        if _blocks is None:
+            vstate = vb.post_attn_at_layer(layer_id, vstate, attn_v.contiguous(), vpost)
+            astate = ab.post_attn_at_layer(layer_id, astate, attn_a.contiguous(), apost)
+        else:
+            vstate = vb.post_attn_at_layer_for_compile(layer_id, vstate, attn_v.contiguous(), vpost, block=_blocks[0])
+            astate = ab.post_attn_at_layer_for_compile(layer_id, astate, attn_a.contiguous(), apost, block=_blocks[1])
         return vstate, astate
 
     def _step_checkpointed(
@@ -298,6 +309,18 @@ class DualSystemMoTDriver:
         next layer's iteration in ``run_joint_loop``.
         """
         outer_payload = astate.payload
+        compiled = None
+        if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer
+
+            if "mot" in compile_scope():
+                if vstate.extras.get("vace") is not None:
+                    raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                if self._compiled_layer is None:
+                    self._compiled_layer = compile_mot_layer(self)
+                compiled = self._compiled_layer
+                video_block = vstate.extras["dit"].blocks[layer_id]
+                action_block = self.ab.blocks[layer_id]
 
         def _run(vx: Tensor, ax: Tensor) -> Tuple[Tensor, Tensor]:
             local_vstate = copy.copy(vstate)
@@ -306,17 +329,30 @@ class DualSystemMoTDriver:
             local_astate.payload = local_payload
             local_vstate.hidden_states = vx
             local_payload.x_action = ax
-            self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            if compiled is None:
+                self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            else:
+                compiled(video_block, action_block, local_vstate, local_astate, attn_mask)
             return local_vstate.hidden_states, local_payload.x_action
 
         vx0 = vstate.hidden_states
         ax0 = outer_payload.x_action
 
+        checkpoint_kwargs = {"use_reentrant": False}
+        if enabled("OPENWAM_OPT_SAC_FFN"):
+            from openwam.optimizations.checkpoint import ffn_output_context_fn
+
+            if offload:
+                raise ValueError("OPENWAM_OPT_SAC_FFN requires gradient checkpoint offload to be disabled")
+            ffn = vstate.extras["dit"].blocks[layer_id].ffn
+            input_weight = ffn[0].weight if enabled("OPENWAM_OPT_SAC_FFN_INPUT") else None
+            checkpoint_kwargs["context_fn"] = ffn_output_context_fn(ffn[-1].weight, input_weight)
+
         if offload:
             with torch.autograd.graph.save_on_cpu():
-                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, **checkpoint_kwargs)
         else:
-            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, **checkpoint_kwargs)
 
         vstate.hidden_states = new_vx
         outer_payload.x_action = new_ax

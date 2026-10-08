@@ -14,7 +14,6 @@ from torch import Tensor
 
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
-from openwam.optimizations import enabled
 from openwam.optimizations.text import cached_text
 
 
@@ -41,12 +40,8 @@ def _encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Ten
     mask = mask.to(device)
     seq_lens = mask.gt(0).sum(dim=1).long()
     context = text_encoder(ids, mask)
-    if enabled("OPENWAM_OPT_TEXT_MASK"):
-        positions = torch.arange(context.shape[1], device=context.device)
-        context = context.masked_fill((positions.unsqueeze(0) >= seq_lens.unsqueeze(1)).unsqueeze(-1), 0)
-    else:
-        for i, v in enumerate(seq_lens):
-            context[i, v:] = 0
+    for i, v in enumerate(seq_lens):
+        context[i, v:] = 0
     return context, seq_lens
 
 

@@ -20,7 +20,9 @@ def _varlen_kernel():
     except ImportError:
         logger.warning("[optimizations] FA2 padding skipped: flash_attn_varlen_func unavailable")
         return None
-    return flash_attn_varlen_func
+    from openwam.optimizations._fa2_varlen import packed_varlen_kernel
+
+    return packed_varlen_kernel(flash_attn_varlen_func)
 
 
 def _padding_keys(mask, batch, query_len, key_len):
@@ -66,6 +68,16 @@ def _padding_plan(mask, keep):
 
 
 def fa2_padding(q, k, v, mask, num_heads):
+    if (
+        enabled("OPENWAM_OPT_FA2_PADDING")
+        and enabled("OPENWAM_OPT_GLOBAL_COMPILE")
+        and torch.compiler.is_compiling()
+    ):
+        return _eager_fa2_padding(q, k, v, mask, num_heads)
+    return _fa2_padding(q, k, v, mask, num_heads)
+
+
+def _fa2_padding(q, k, v, mask, num_heads):
     """Return (B,Sq,H*D) or None when the mask/backend cannot use this fast path."""
     if not enabled("OPENWAM_OPT_FA2_PADDING") or mask is None:
         return None
@@ -93,6 +105,9 @@ def fa2_padding(q, k, v, mask, num_heads):
     cu_q = torch.arange(batch + 1, device=q.device, dtype=torch.int32) * sq
     out = kernel(qp, kp, vp, cu_q, cu_k, sq, sk, dropout_p=0.0, causal=False)
     return out.reshape(batch, sq, dim).masked_fill((~nonempty).view(batch, 1, 1), 0)
+
+
+_eager_fa2_padding = torch.compiler.disable(_fa2_padding)
 
 
 def split_mask_plan(mask):

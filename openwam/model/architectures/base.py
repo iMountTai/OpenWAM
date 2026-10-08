@@ -1101,7 +1101,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
-        video_noise = torch.randn_like(inputs["input_latents"])
+        # Keep seeded noise tied to logical coordinates, independent of VAE layout.
+        video_noise = torch.randn_like(inputs["input_latents"], memory_format=torch.contiguous_format)
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
         inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
         video_target = video_noise - inputs["input_latents"]

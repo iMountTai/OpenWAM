@@ -58,7 +58,7 @@ def rope_apply_1d(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated tensor with the same dtype and shape as ``x``.
     """
-    if enabled("OPENWAM_OPT_ROPE_FP32") or enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+    if enabled("OPENWAM_OPT_ROPE_REAL"):
         return pointwise.rotate(x, freqs.view(1, 1, x.shape[-2], -1))
     x_c = torch.view_as_complex(x.to(torch.float64).reshape(*x.shape[:-1], -1, 2))
     freqs = freqs.to(x_c.device).view(1, 1, x_c.shape[-2], x_c.shape[-1])
@@ -74,7 +74,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or enabled("OPENWAM_OPT_LIGHTOP_NORM"):
             return pointwise.rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         normed = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)

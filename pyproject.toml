@@ -62,9 +62,6 @@ include-package-data = true
 where = ["./"]
 include = ["openwam", "openwam.*"]
 
-[tool.setuptools.package-data]
-"openwam.optimizations.vae_fused" = ["LICENSE", "NOTICE"]
-
 [project.scripts]
 openwam-serve = "openwam.deploy.server:main"
 

@@ -791,14 +791,15 @@ class ActionDiT(ActionDiTBackbone):
         }
         return q_out, k_out, v_out, post_state
 
-    def pre_attn_at_layer_for_compile(self, layer_id: int, astate: "ActionState"):
+    def pre_attn_at_layer_for_compile(self, layer_id: int, astate: "ActionState", *, block=None):
         """Compile-friendly pre-attention half using a tensor tuple post-state.
 
         Returns a 4-tuple ``(q, k, v, post_state)`` where ``post_state`` is the
         tensor tuple ``(residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp)``.
         """
         payload: ActionDiTState = astate.payload
-        block: SelfAttnActionDiTBlock = self.blocks[layer_id]
+        if block is None:
+            block = self.blocks[layer_id]
 
         chunks = (block.modulation.to(dtype=payload.t_mod.dtype, device=payload.t_mod.device) + payload.t_mod).chunk(
             6, dim=1
@@ -859,10 +860,12 @@ class ActionDiT(ActionDiTBackbone):
         astate: "ActionState",
         attn_out: torch.Tensor,
         post_state: tuple[torch.Tensor, ...],
+        *, block=None,
     ) -> "ActionState":
         """Compile-friendly post-attention half consuming a tensor tuple."""
         payload: ActionDiTState = astate.payload
-        block: SelfAttnActionDiTBlock = self.blocks[layer_id]
+        if block is None:
+            block = self.blocks[layer_id]
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
         x = block.gate(residual_x, gate_msa, block.self_attn.o(attn_out))

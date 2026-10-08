@@ -8,18 +8,17 @@ logger = logging.getLogger(__name__)
 SWITCHES = (
     "OPENWAM_OPT_VAE_CHANNELS_LAST",
     "OPENWAM_OPT_CONSTANT_CACHE",
-    "OPENWAM_OPT_TEXT_MASK",
     "OPENWAM_OPT_TEXT_CACHE",
-    "OPENWAM_OPT_VIDEO_PREPROCESS",
     "OPENWAM_OPT_FA2_PADDING",
     "OPENWAM_OPT_MOT_SPLIT_ATTN",
     "OPENWAM_OPT_POINTWISE_COMPILE",
-    "OPENWAM_OPT_ROPE_FP32",
+    "OPENWAM_OPT_ROPE_REAL",
     "OPENWAM_OPT_ZERO_OVERLAP",
-    "OPENWAM_OPT_TF32",
-    "OPENWAM_OPT_VAE_HIPDNN",
-    "OPENWAM_OPT_VAE_CONCAT_CACHE_WEIGHT",
-    "OPENWAM_OPT_VAE_CONCAT_SINGLETON_RESTRIDE",
+    "OPENWAM_OPT_SAC_FFN",
+    "OPENWAM_OPT_LIGHTOP_NORM",
+    "OPENWAM_OPT_VAE_POINTWISE_COMPILE",
+    "OPENWAM_OPT_SAC_FFN_INPUT",
+    "OPENWAM_OPT_GLOBAL_COMPILE",
 )
 
 
@@ -37,49 +36,65 @@ def enabled(name: str, default: bool = False) -> bool:
 def configure_backends() -> None:
     """Called by scripts/train.py before model construction and device setup."""
     flags = {name: enabled(name) for name in SWITCHES}
-    if flags["OPENWAM_OPT_VAE_HIPDNN"] and not flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
-        raise ValueError("OPENWAM_OPT_VAE_HIPDNN=1 requires OPENWAM_OPT_VAE_CHANNELS_LAST=1")
-    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
-        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
-        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
-    if flags["OPENWAM_OPT_TF32"]:
-        import torch
+    if flags["OPENWAM_OPT_GLOBAL_COMPILE"]:
+        from openwam.optimizations.global_compile import compile_scope
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    if flags["OPENWAM_OPT_VAE_HIPDNN"]:
+        compile_scope()
+    if flags["OPENWAM_OPT_SAC_FFN_INPUT"] and not flags["OPENWAM_OPT_SAC_FFN"]:
+        raise ValueError("OPENWAM_OPT_SAC_FFN_INPUT=1 requires OPENWAM_OPT_SAC_FFN=1")
+    if flags["OPENWAM_OPT_LIGHTOP_NORM"]:
         import torch
 
         if getattr(torch.version, "hip", None):
-            from openwam.optimizations.vae_fused._hipdnn import require_hipdnn
+            from openwam.optimizations.norms import lightop_ops
 
-            require_hipdnn()
-        else:
-            logger.warning("[optimizations] VAE hipDNN inactive: this is not a HIP PyTorch build")
+            lightop_ops()
+    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
+        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
     if os.environ.get("RANK", "0") == "0":
         logger.info("[optimizations] switches=%s", {name: int(value) for name, value in flags.items()})
 
 
 def configure_zero(config: dict) -> None:
     if enabled("OPENWAM_OPT_ZERO_OVERLAP"):
-        config["zero_optimization"].update(overlap_comm=True, contiguous_gradients=True)
-        logger.info("[optimizations] ZeRO overlap_comm=True, contiguous_gradients=True")
+        zero = config["zero_optimization"]
+        zero.update(overlap_comm=True, contiguous_gradients=True)
+        # Retain the measured ZeRO-2 default and explicit caller configurations.
+        # Bucket size is in elements, not bytes.
+        if zero.get("stage") == 2:
+            zero.setdefault("reduce_bucket_size", 500_000_000)
+        logger.info(
+            "[optimizations] ZeRO overlap_comm=True, contiguous_gradients=True, reduce_bucket_size=%s",
+            zero.get("reduce_bucket_size", "default"),
+        )
 
 
 def prepare_model(architecture) -> None:
-    """Convert frozen VAE weights before DeepSpeed partitions parameters."""
-    if not enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
+    """Prepare VAE layout and lazy compilation before DeepSpeed."""
+    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST")
+    compile_vae = False
+    if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+        from openwam.optimizations.global_compile import compile_scope
+
+        compile_vae = "vae" in compile_scope()
+    if not layout and not compile_vae:
         return
     import torch
 
     backbone = getattr(architecture, "video_backbone", None)
     vae = getattr(backbone, "vae", None)
     if vae is None:
-        logger.warning("[optimizations] VAE channels-last skipped: no native Wan VAE")
+        logger.warning("[optimizations] VAE preparation skipped: no native Wan VAE")
         return
-    torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
-    torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
-    logger.info("[optimizations] native VAE Conv2d/Conv3d weights use channels-last")
+    if layout:
+        torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
+        torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
+        logger.info("[optimizations] native VAE Conv2d/Conv3d weights use channels-last")
+    if compile_vae:
+        from openwam.optimizations.global_compile import compile_vae_encoder
+
+        compile_vae_encoder(vae)
 
 
 def prepare_runtime_constants(architecture) -> None:

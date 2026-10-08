@@ -3,6 +3,7 @@
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 
 from openwam.optimizations import enabled
 
@@ -13,6 +14,10 @@ def _compiled(fn):
 
 
 def _run(fn, *args):
+    if torch.compiler.is_compiling() and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+        # The enclosing block already compiles this expression. A nested
+        # dispatch would specialize this shared helper for every expression.
+        return fn(*args)
     if args[0].is_cuda and enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
         return _compiled(fn)(*args)
     return fn(*args)
@@ -24,7 +29,54 @@ def _rms(x, weight, eps):
 
 
 def rms_norm(x, weight, eps):
+    if enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+        from openwam.optimizations.norms import lightop_rms_norm
+
+        result = lightop_rms_norm(x, weight, eps)
+        if result is not None:
+            return result
     return _run(_rms, x, weight, eps)
+
+
+def _vae_norm_value(x, gamma, bias, dim, scale):
+    return F.normalize(x, dim=dim) * scale * gamma + bias
+
+
+def _vae_norm_silu_value(x, gamma, bias, dim, scale):
+    return F.silu(_vae_norm_value(x, gamma, bias, dim, scale))
+
+
+@lru_cache(maxsize=None)
+def _compiled_vae_norm(dim, scale, rank, apply_silu):
+    normalize = _vae_norm_silu_value if apply_silu else _vae_norm_value
+
+    import torch._inductor
+
+    options = {"emulate_precision_casts": True} if "emulate_precision_casts" in torch._inductor.list_options() else {}
+    return torch.compile(normalize, dynamic=True, fullgraph=True, options=options)
+
+
+def vae_normalize(x, gamma, bias, dim, scale, apply_silu=False):
+    if torch.compiler.is_compiling() and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+        normalize = _vae_norm_silu_value if apply_silu else _vae_norm_value
+        return normalize(x, gamma, bias, dim, scale)
+    if x.is_cuda and enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE"):
+        from torch._dynamo import mark_static
+
+        if x.ndim == 5 and dim == 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
+            # Unit dimensions may carry different equivalent strides after
+            # resampling. Use a metadata view to share the compiled graph.
+            n, c, t, h, w = x.shape
+            x = x.as_strided((n, c, t, h, w), (c * t * h * w, 1, h * w * c, w * c, c))
+        # Keep the reduction width constant while sharing graphs across the
+        # encoder's spatial/temporal shapes, without changing global limits.
+        mark_static(x, dim)
+        mark_static(gamma)
+        if isinstance(bias, torch.Tensor):
+            mark_static(bias)
+        return _compiled_vae_norm(dim, scale, x.ndim, apply_silu)(x, gamma, bias, dim, scale)
+    value = F.normalize(x, dim=dim) * scale * gamma + bias
+    return F.silu(value) if apply_silu else value
 
 
 def _modulate(x, shift, scale):
@@ -43,8 +95,8 @@ def gate(x, gate_value, residual):
     return _run(_gate, x, gate_value, residual)
 
 
-def _rotate(x, freqs, use_fp32):
-    work_dtype = torch.float32 if use_fp32 else torch.float64
+def _rotate(x, freqs):
+    work_dtype = torch.float64
     pairs = x.to(work_dtype).reshape(*x.shape[:-1], -1, 2)
     real = freqs.real.to(device=x.device, dtype=work_dtype)
     imag = freqs.imag.to(device=x.device, dtype=work_dtype)
@@ -54,4 +106,4 @@ def _rotate(x, freqs, use_fp32):
 
 
 def rotate(x, freqs):
-    return _run(_rotate, x, freqs, enabled("OPENWAM_OPT_ROPE_FP32"))
+    return _run(_rotate, x, freqs)

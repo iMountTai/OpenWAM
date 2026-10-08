@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
-from openwam.optimizations import enabled
+from openwam.optimizations import enabled, pointwise
 
 CACHE_T = 2
 
@@ -43,26 +43,6 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        if enabled("OPENWAM_OPT_VAE_HIPDNN") and enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
-            if (
-                x.is_cuda
-                and getattr(torch.version, "hip", None)
-                and not torch.is_grad_enabled()
-                and self.kernel_size == (3, 3, 3)
-                and self._padding == (1, 1, 1, 1, 2, 0)
-                and self.stride == (1, 1, 1)
-                and self.dilation == (1, 1, 1)
-                and self.groups == 1
-                and self.in_channels in (160, 320, 640)
-                and self.out_channels in (160, 320, 640)
-                and x.dtype == self.weight.dtype
-                and x.dtype in (torch.float16, torch.bfloat16)
-            ):
-                from openwam.optimizations.vae_fused.concat_conv_bias import fused_concat_conv_bias
-
-                return fused_concat_conv_bias(
-                    _layout(x), None if cache_x is None else _layout(cache_x.to(x.device)), self.weight, self.bias
-                )
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -85,6 +65,10 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
+        if enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE"):
+            return pointwise.vae_normalize(
+                x, self.gamma, self.bias, 1 if self.channel_first else -1, self.scale
+            )
         return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
 
 
@@ -242,7 +226,22 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
-        for layer in self.residual:
+        skip_silu = False
+        for layer_id, layer in enumerate(self.residual):
+            if skip_silu:
+                skip_silu = False
+                continue
+            if (
+                enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE")
+                and isinstance(layer, RMS_norm)
+                and layer_id + 1 < len(self.residual)
+                and isinstance(self.residual[layer_id + 1], nn.SiLU)
+            ):
+                x = pointwise.vae_normalize(
+                    x, layer.gamma, layer.bias, 1 if layer.channel_first else -1, layer.scale, apply_silu=True
+                )
+                skip_silu = True
+                continue
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])

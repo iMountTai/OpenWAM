@@ -814,7 +814,8 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         video_timesteps = vb.scheduler.timesteps[video_timestep_ids].to(dtype=_dtype, device=_device)
         video_sigmas = vb.scheduler.sigmas[video_timestep_ids].to(dtype=_dtype, device=_device)
 
-        video_noise = torch.randn_like(input_latents)
+        # Keep seeded noise tied to logical coordinates, independent of VAE layout.
+        video_noise = torch.randn_like(input_latents, memory_format=torch.contiguous_format)
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
         latents_noisy = (1 - sigma_bc) * input_latents + sigma_bc * video_noise
         video_target = video_noise - input_latents
@@ -853,7 +854,7 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
             cond_sigmas = vb.scheduler.sigmas[cond_sampled_ids].to(dtype=_dtype, device=_device)
             cond_sampled_timesteps = vb.scheduler.timesteps[cond_sampled_ids].to(dtype=_dtype, device=_device)
             cond_video_timesteps = torch.where(cond_noise_mask, cond_sampled_timesteps, cond_video_timesteps)
-            noise_cond = torch.randn_like(input_latents)
+            noise_cond = torch.randn_like(input_latents, memory_format=torch.contiguous_format)
             cond_sigma_bc = cond_sigmas.view(B, 1, 1, 1, 1)
             latents_cond_noisy = (1 - cond_sigma_bc) * input_latents + cond_sigma_bc * noise_cond
             selector = cond_noise_mask.view(B, 1, 1, 1, 1)
