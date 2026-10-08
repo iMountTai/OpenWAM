@@ -135,7 +135,7 @@ def discover_robotwin_roots(
         dataset_dir: Top-level directory (e.g. ``/path/to/robotwin_2_0/dataset``).
         embodiment: Robot embodiment name (e.g. ``"aloha-agilex"``).
         variant: ``"clean_50"`` or ``"randomized_500"``.
-        tasks: Optional internal task restriction.  When omitted, every task
+        tasks: Optional task restriction. When omitted, every task
             directory containing the requested embodiment/variant is discovered.
 
     Returns:
@@ -884,7 +884,7 @@ class MultiTaskRoboTwinDataset(BaseDataset):
         embodiment: Robot embodiment name (e.g. ``"aloha-agilex"``).
         variant: ``"clean_50"``, ``"randomized_500"``, or ``"both"``
             (merges clean_50 + randomized_500 into a single dataset).
-        tasks: Optional internal task restriction. Defaults to every task
+        tasks: Optional task restriction. Defaults to every task
             discovered on disk.
         normalization_stats_path: Path to shared action stats (.npy).
         action_mode: ``"joint"`` (14D) or ``"eef"`` (20D).
@@ -896,7 +896,7 @@ class MultiTaskRoboTwinDataset(BaseDataset):
 
     @classmethod
     def from_config(cls, config, split: str = "train"):
-        """Build from Hydra DictConfig or dict and discover all tasks on disk."""
+        """Build from Hydra DictConfig or dict, optionally restricting tasks."""
 
         def _get(key, default=None):
             if hasattr(config, key):
@@ -912,6 +912,10 @@ class MultiTaskRoboTwinDataset(BaseDataset):
         if _cam_layout is not None:
             _cam_layout = list(_cam_layout)
 
+        _tasks = _get("tasks", None)
+        if _tasks is not None:
+            _tasks = list(_tasks)
+
         # normalize_mode can be null/None to disable
         _norm_mode = _get("normalize_mode", "min-max")
         if isinstance(_norm_mode, str) and _norm_mode.lower() in ("none", "null", ""):
@@ -921,6 +925,7 @@ class MultiTaskRoboTwinDataset(BaseDataset):
             dataset_dir=_get("dataset_dir"),
             embodiment=_get("embodiment", "aloha-agilex"),
             variant=_get("variant", "both"),
+            tasks=_tasks,
             normalization_stats_path=_get("normalization_stats_path", None),
             normalize_mode=_norm_mode,
             action_mode=_get("action_mode", "eef"),
