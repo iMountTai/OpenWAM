@@ -2,8 +2,6 @@
 
 import os
 
-from openwam.optimizations import enabled
-
 
 def integer(name, default, minimum=0):
     raw = os.environ.get(name, str(default))
@@ -16,10 +14,16 @@ def integer(name, default, minimum=0):
     return value
 
 
+def checkpoint_skip_layers():
+    """Number of trailing layers without checkpointing; unset/false means zero."""
+    name = "OPENWAM_OPT_PARTIAL_CHECKPOINT"
+    if os.environ.get(name, "").strip().lower() in {"", "false", "no", "off"}:
+        return 0
+    return integer(name, 0)
+
+
 def checkpoint_layers(total):
-    if not enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT"):
-        return total
-    count = integer("OPENWAM_CHECKPOINT_LAYERS", min(16, total))
-    if count > total:
-        raise ValueError(f"OPENWAM_CHECKPOINT_LAYERS={count} exceeds model layers={total}")
-    return count
+    skip = checkpoint_skip_layers()
+    if skip > total:
+        raise ValueError(f"OPENWAM_OPT_PARTIAL_CHECKPOINT={skip} exceeds model layers={total}")
+    return total - skip

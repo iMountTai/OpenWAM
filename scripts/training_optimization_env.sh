@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Source this file before the existing torchrun command. Each invocation resets
-# optimization switches, then enables only the named groups.
+# optimization settings, then enables only the named groups. PARTIAL_CHECKPOINT
+# is a layer count; zero keeps checkpointing on all layers when configured.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     echo 'Usage: source scripts/training_optimization_env.sh baseline|<group> [<group> ...]' >&2
     exit 2
@@ -41,7 +42,7 @@ _openwam_set_optimization_env() {
             sac_ffn_input) export OPENWAM_OPT_SAC_FFN=1 OPENWAM_OPT_SAC_FFN_INPUT=1 ;;
             global_compile) export OPENWAM_OPT_GLOBAL_COMPILE=1 ;;
             zero_overlap) export OPENWAM_OPT_ZERO_OVERLAP=1 ;;
-            partial_checkpoint) export OPENWAM_OPT_PARTIAL_CHECKPOINT=1 ;;
+            partial_checkpoint) export OPENWAM_OPT_PARTIAL_CHECKPOINT=16 ;;
             uint8_preprocess) export OPENWAM_OPT_UINT8_PREPROCESS=1 ;;
             t5_prefix) export OPENWAM_OPT_T5_PREFIX=1 ;;
             text_trim) export OPENWAM_OPT_TEXT_TRIM=1 ;;

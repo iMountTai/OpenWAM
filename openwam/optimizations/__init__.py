@@ -1,4 +1,4 @@
-"""Opt-in training optimizations; all switches default to the original path."""
+"""Opt-in training optimizations; absent settings preserve the original path."""
 
 import logging
 import os
@@ -28,6 +28,10 @@ SWITCHES = (
 
 
 def enabled(name: str, default: bool = False) -> bool:
+    if name == "OPENWAM_OPT_PARTIAL_CHECKPOINT":
+        from openwam.optimizations.runtime import checkpoint_skip_layers
+
+        return checkpoint_skip_layers() > 0
     value = os.environ.get(name, "").strip().lower()
     if not value:
         return default
@@ -41,10 +45,7 @@ def enabled(name: str, default: bool = False) -> bool:
 def configure_backends() -> None:
     """Called by scripts/train.py before model construction and device setup."""
     flags = {name: enabled(name) for name in SWITCHES}
-    from openwam.optimizations.runtime import integer
-
-    if flags["OPENWAM_OPT_PARTIAL_CHECKPOINT"]:
-        integer("OPENWAM_CHECKPOINT_LAYERS", 16)
+    from openwam.optimizations.runtime import checkpoint_skip_layers
     if flags["OPENWAM_OPT_GLOBAL_COMPILE"]:
         from openwam.optimizations.global_compile import compile_scope
 
@@ -62,7 +63,9 @@ def configure_backends() -> None:
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
     if os.environ.get("RANK", "0") == "0":
-        logger.info("[optimizations] switches=%s", {name: int(value) for name, value in flags.items()})
+        settings = {name: int(value) for name, value in flags.items()}
+        settings["OPENWAM_OPT_PARTIAL_CHECKPOINT"] = checkpoint_skip_layers()
+        logger.info("[optimizations] switches=%s", settings)
 
 
 def configure_zero(config: dict) -> None:

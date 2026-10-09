@@ -426,9 +426,10 @@ class DualSystemMoTDriver:
         partial = enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT")
         if partial and getattr(self, "_reported_checkpoint_count", None) != checkpoint_count:
             logging.getLogger(__name__).info(
-                "[optimizations] partial checkpoint boundary=%d/%d, outer checkpoint=%s; "
-                "remaining layers have no inner attention checkpoint",
-                checkpoint_count, self.num_layers, bool(use_gradient_checkpointing and self.ab.training),
+                "[optimizations] checkpointed layers=%d/%d, no-checkpoint tail=%d, outer checkpoint=%s; "
+                "tail layers have no inner attention checkpoint",
+                checkpoint_count, self.num_layers, self.num_layers - checkpoint_count,
+                bool(use_gradient_checkpointing and self.ab.training),
             )
             self._reported_checkpoint_count = checkpoint_count
         for layer_id in range(self.num_layers):
