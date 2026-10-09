@@ -31,6 +31,7 @@ from openwam.model.architectures.utils.mask_modes import (
 )
 from openwam.optimizations import enabled
 from openwam.optimizations.attention import split_attention, split_mask_plan
+from openwam.optimizations.sac import run_attention
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
@@ -150,6 +151,11 @@ class DualSystemMoTDriver:
         in both backbones). Output is the same layout. SDPA is used so an
         optional bool ``attn_mask`` (True = keep) can be honored.
         """
+        return run_attention(
+            self._mixed_attention_impl, q_cat, k_cat, v_cat, attn_mask, label="mixed_attention",
+        )
+
+    def _mixed_attention_impl(self, q_cat, k_cat, v_cat, attn_mask):
         if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN"):
             from openwam.model.video_backbone.wan.models.dit import flash_attention
 
@@ -364,6 +370,13 @@ class DualSystemMoTDriver:
             ffn = vstate.extras["dit"].blocks[layer_id].ffn
             input_weight = ffn[0].weight if enabled("OPENWAM_OPT_SAC_FFN_INPUT") else None
             checkpoint_kwargs["context_fn"] = ffn_output_context_fn(ffn[-1].weight, input_weight)
+        else:
+            from openwam.optimizations.sac import active, context_fn
+
+            if active() or enabled("OPENWAM_CHECKPOINT_STATS"):
+                if offload and active():
+                    raise ValueError("Complete SAC requires gradient checkpoint offload to be disabled")
+                checkpoint_kwargs["context_fn"] = context_fn(layer_id, self.num_layers)
 
         if offload:
             with torch.autograd.graph.save_on_cpu():
@@ -424,6 +437,19 @@ class DualSystemMoTDriver:
 
         checkpoint_count = checkpoint_layers(self.num_layers)
         partial = enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT")
+        from openwam.optimizations.sac import active, layers, validate
+
+        if active():
+            validate(self.num_layers)
+            if self.ab.training and not use_gradient_checkpointing:
+                raise ValueError("Complete SAC requires training.use_gradient_checkpointing=True")
+            count = layers(self.num_layers)
+            if getattr(self, "_reported_sac_layers", None) != count:
+                logging.getLogger(__name__).info(
+                    "[optimizations] standard SAC covers trailing %d/%d MoT layers; all layers keep checkpointing",
+                    count, self.num_layers,
+                )
+                self._reported_sac_layers = count
         if partial and getattr(self, "_reported_checkpoint_count", None) != checkpoint_count:
             logging.getLogger(__name__).info(
                 "[optimizations] checkpointed layers=%d/%d, no-checkpoint tail=%d, outer checkpoint=%s; "

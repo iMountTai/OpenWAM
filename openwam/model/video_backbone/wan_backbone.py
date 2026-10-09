@@ -540,11 +540,13 @@ class WanBase(VideoBackbone):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
         residual_x = state.hidden_states
-        attn_input = modulate(block.norm1(state.hidden_states), shift_msa, scale_msa)
+        from openwam.optimizations.sac import run_norm
+
+        attn_input = modulate(run_norm(block.norm1, state.hidden_states), shift_msa, scale_msa)
 
         self_attn = block.self_attn
-        q = self_attn.norm_q(video_linear(self_attn.q, attn_input))
-        k = self_attn.norm_k(video_linear(self_attn.k, attn_input))
+        q = run_norm(self_attn.norm_q, video_linear(self_attn.q, attn_input))
+        k = run_norm(self_attn.norm_k, video_linear(self_attn.k, attn_input))
         v = video_linear(self_attn.v, attn_input)
         q = rope_apply(q, state.rope_freqs, self_attn.num_heads)
         k = rope_apply(k, state.rope_freqs, self_attn.num_heads)
@@ -582,12 +584,16 @@ class WanBase(VideoBackbone):
         context_mask = None
         if state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
+        from openwam.optimizations.sac import ffn_boundary, run_ffn as run_complete_ffn, run_norm
+
         hidden_states = hidden_states + block.cross_attn(
-            block.norm3(hidden_states), state.context, ctx_mask=context_mask,
+            run_norm(block.norm3, hidden_states), state.context, ctx_mask=context_mask,
             **cross_attention_kwargs(block.cross_attn),
         )
-        mlp_input = modulate(block.norm2(hidden_states), shift_mlp, scale_mlp)
-        if enabled("OPENWAM_OPT_SAC_FFN"):
+        mlp_input = modulate(run_norm(block.norm2, hidden_states), shift_mlp, scale_mlp)
+        if ffn_boundary():
+            mlp_output = run_complete_ffn(block.ffn, mlp_input, video=True)
+        elif enabled("OPENWAM_OPT_SAC_FFN"):
             from openwam.optimizations.checkpoint import run_ffn
 
             mlp_output = run_ffn(block.ffn, mlp_input)

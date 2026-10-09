@@ -12,6 +12,7 @@ from openwam.optimizations import enabled, pointwise
 from openwam.optimizations.attention import fa2_padding
 from openwam.optimizations.linear_bias2d import video_linear
 from openwam.optimizations.norms import LayerNorm
+from openwam.optimizations.sac import extras_enabled, run_attention, run_norm, run_projection
 
 try:
     import flash_attn_interface
@@ -54,6 +55,12 @@ def flash_attention(
     compatibility_mode=False,
     attn_mask: Optional[torch.Tensor] = None,
 ):
+    return run_attention(
+        _flash_attention_impl, q, k, v, num_heads, compatibility_mode=compatibility_mode, attn_mask=attn_mask,
+    )
+
+
+def _flash_attention_impl(q, k, v, num_heads, compatibility_mode=False, attn_mask=None):
     # FA2/FA3/sage are CUDA half-precision kernels; they raise on anything else.
     fused_ok = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
     if not compatibility_mode:
@@ -96,7 +103,7 @@ def flash_attention(
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
         return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
@@ -178,13 +185,13 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
 
     def forward(self, x, freqs, attn_mask: Optional[torch.Tensor] = None):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+        q = run_norm(self.norm_q, run_projection(self.q, x))
+        k = run_norm(self.norm_k, run_projection(self.k, x))
+        v = run_projection(self.v, x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v, attn_mask=attn_mask)
-        return self.o(x)
+        return run_projection(self.o, x)
 
 
 class CrossAttention(nn.Module):
@@ -219,16 +226,16 @@ class CrossAttention(nn.Module):
                 ctx_mask = ctx_mask[..., 257:]
         else:
             ctx = y
-        q = self.norm_q(video_linear(self.q, x) if linear_bias2d else self.q(x))
-        k = self.norm_k(self.k(ctx))
-        v = self.v(ctx)
-        x = self.attn(q, k, v, attn_mask=ctx_mask)
+        q = run_norm(self.norm_q, video_linear(self.q, x) if linear_bias2d else run_projection(self.q, x))
+        k = run_norm(self.norm_k, run_projection(self.k, ctx))
+        v = run_projection(self.v, ctx)
+        x = run_attention(self.attn, q, k, v, attn_mask=ctx_mask, label="video_cross_attention")
         if self.has_image_input:
-            k_img = self.norm_k_img(self.k_img(img))
-            v_img = self.v_img(img)
-            y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+            k_img = run_norm(self.norm_k_img, run_projection(self.k_img, img))
+            v_img = run_projection(self.v_img, img)
+            y = run_attention(flash_attention, q, k_img, v_img, num_heads=self.num_heads, label="video_cross_attention")
             x = x + y
-        return video_linear(self.o, x) if linear_bias2d else self.o(x)
+        return video_linear(self.o, x) if linear_bias2d else run_projection(self.o, x)
 
 
 class GateModule(nn.Module):
@@ -238,7 +245,7 @@ class GateModule(nn.Module):
         super().__init__()
 
     def forward(self, x, gate, residual):
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
             return pointwise.gate(x, gate, residual)
         return x + gate * residual
 

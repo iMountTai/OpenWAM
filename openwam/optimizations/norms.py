@@ -31,6 +31,10 @@ def _supported(x, *parameters):
 def lightop_rms_norm(x, weight, eps):
     if enabled("OPENWAM_OPT_GLOBAL_COMPILE") and torch.compiler.is_compiling():
         return None
+    from openwam.optimizations.sac import extras_enabled, native_mot_expression
+
+    if extras_enabled() and not torch.compiler.is_compiling() and native_mot_expression():
+        return None
     if not _supported(x, weight):
         return None
     flat = x.reshape(-1, x.shape[-1])
@@ -39,8 +43,14 @@ def lightop_rms_norm(x, weight, eps):
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x):
+        native_sac = False
+        from openwam.optimizations.sac import extras_enabled, native_mot_expression
+
+        if extras_enabled() and not torch.compiler.is_compiling():
+            native_sac = native_mot_expression()
         if (
             enabled("OPENWAM_OPT_LIGHTOP_NORM")
+            and not native_sac
             and not (enabled("OPENWAM_OPT_GLOBAL_COMPILE") and torch.compiler.is_compiling())
             and tuple(self.normalized_shape) == (x.shape[-1],)
             and _supported(x, self.weight, self.bias)

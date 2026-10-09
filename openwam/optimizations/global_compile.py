@@ -51,12 +51,14 @@ def mark_mot_text_dynamic(vstate, astate):
 
 
 def compile_mot_layer(driver):
+    from openwam.optimizations.sac import attention_boundary, active
+
     fragmented = any(enabled(name) for name in (
         "OPENWAM_OPT_MOT_SPLIT_ATTN", "OPENWAM_OPT_FA2_PADDING", "OPENWAM_OPT_SAC_FFN",
-    ))
+    )) or active()
     driver._compiled_attention = (
         torch.compiler.disable(driver._mixed_attention)
-        if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN") else driver._mixed_attention
+        if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN") or attention_boundary() else driver._mixed_attention
     )
 
     def layer(video_block, action_block, vstate, astate, attn_mask):

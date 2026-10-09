@@ -24,6 +24,9 @@ SWITCHES = (
     "OPENWAM_OPT_T5_PREFIX",
     "OPENWAM_OPT_TEXT_TRIM",
     "OPENWAM_OPT_LINEAR_BIAS2D",
+    "OPENWAM_OPT_SAC_FA",
+    "OPENWAM_OPT_SAC_FFN_FULL",
+    "OPENWAM_OPT_SAC_GEMM",
 )
 
 
@@ -46,6 +49,9 @@ def configure_backends() -> None:
     """Called by scripts/train.py before model construction and device setup."""
     flags = {name: enabled(name) for name in SWITCHES}
     from openwam.optimizations.runtime import checkpoint_skip_layers
+    from openwam.optimizations.sac import validate
+
+    validate()
     if flags["OPENWAM_OPT_GLOBAL_COMPILE"]:
         from openwam.optimizations.global_compile import compile_scope
 
@@ -84,6 +90,9 @@ def configure_zero(config: dict) -> None:
 
 def prepare_model(architecture) -> None:
     """Prepare VAE layout and lazy compilation before DeepSpeed."""
+    from openwam.optimizations.sac import prepare
+
+    prepare(architecture)
     if enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT"):
         if type(architecture).__name__ != "DualSystemSelfAttnArchitecture":
             raise ValueError("OPENWAM_OPT_PARTIAL_CHECKPOINT currently requires dual_system/joint_self_attn")

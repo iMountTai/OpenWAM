@@ -209,6 +209,10 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         )
 
         if noisy_actions is None or ab is None:
+            from openwam.optimizations.sac import active
+
+            if self.training and active():
+                raise ValueError("Complete SAC requires the joint video/action training path")
             for block_id in range(vb.num_layers):
                 vstate = vb.run_block(block_id, vstate)
             return vb.finalize(vstate), None

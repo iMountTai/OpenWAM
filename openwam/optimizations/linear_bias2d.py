@@ -55,6 +55,14 @@ def can_use_bias2d(linear, x):
 
 
 def video_linear(linear, x):
+    from openwam.optimizations.sac import projection_boundary, run_video_projection
+
+    if projection_boundary():
+        return run_video_projection(linear, x)
+    return _video_linear(linear, x)
+
+
+def _video_linear(linear, x):
     if not can_use_bias2d(linear, x):
         return linear(x)
     flat = x.reshape(-1, x.shape[-1])

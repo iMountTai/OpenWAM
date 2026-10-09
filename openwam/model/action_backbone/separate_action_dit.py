@@ -50,6 +50,7 @@ from openwam.model.action_backbone.components import (
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 from openwam.optimizations import enabled, pointwise
 from openwam.optimizations.attention import fa2_padding
+from openwam.optimizations.sac import extras_enabled, ffn_boundary, run_attention, run_ffn, run_norm, run_projection
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
@@ -59,7 +60,7 @@ _MOT_VARIANTS = ("joint_self_attn", "idm")
 
 
 def _modulate(x, shift, scale):
-    if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
         return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
@@ -168,13 +169,16 @@ class BridgeCrossAttention(nn.Module):
         self.norm_k = RMSNorm(self.attn_hidden_dim, eps=eps)
 
     def forward(self, x_action: torch.Tensor, x_video: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
-        q = self.norm_q(self.q(x_action))
-        k = self.norm_k(self.k(x_video))
-        v = self.v(x_video)
+        q = run_norm(self.norm_q, run_projection(self.q, x_action))
+        k = run_norm(self.norm_k, run_projection(self.k, x_video))
+        v = run_projection(self.v, x_video)
+        x = run_attention(self._attend, q, k, v, ctx_mask, label="action_cross_attention")
+        return run_projection(self.o, x)
 
+    def _attend(self, q, k, v, ctx_mask):
         padded = fa2_padding(q, k, v, ctx_mask, self.num_heads)
         if padded is not None:
-            return self.o(padded)
+            return padded
         q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
@@ -185,7 +189,7 @@ class BridgeCrossAttention(nn.Module):
                 ctx_mask = ctx_mask.unsqueeze(1)
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
-        return self.o(x)
+        return x
 
 
 class CrossAttnActionDiTBlock(nn.Module):
@@ -314,7 +318,7 @@ class SelfAttnActionDiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
 
     def gate(self, x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
             return pointwise.gate(x, gate, residual)
         return x + gate * residual
 
@@ -807,12 +811,12 @@ class ActionDiT(ActionDiTBackbone):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
         residual_x = payload.x_action
-        attn_input = _modulate(block.self_attn_norm(residual_x), shift_msa, scale_msa)
+        attn_input = _modulate(run_norm(block.self_attn_norm, residual_x), shift_msa, scale_msa)
 
         sa = block.self_attn
-        q = sa.norm_q(sa.q(attn_input))
-        k = sa.norm_k(sa.k(attn_input))
-        v = sa.v(attn_input)
+        q = run_norm(sa.norm_q, run_projection(sa.q, attn_input))
+        k = run_norm(sa.norm_k, run_projection(sa.k, attn_input))
+        v = run_projection(sa.v, attn_input)
 
         # Apply RoPE in head-split layout to match flash_attn / Wan rope_apply.
         q = rearrange(q, "b s (n d) -> b n s d", n=self._num_heads)
@@ -868,7 +872,7 @@ class ActionDiT(ActionDiTBackbone):
             block = self.blocks[layer_id]
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
-        x = block.gate(residual_x, gate_msa, block.self_attn.o(attn_out))
+        x = block.gate(residual_x, gate_msa, run_projection(block.self_attn.o, attn_out))
         if payload.context is not None:
             text_mask = payload.context_mask
             if text_mask is not None:
@@ -879,9 +883,10 @@ class ActionDiT(ActionDiTBackbone):
                         "ActionDiTState.context_mask must be [B, L], [B, T_action, L], "
                         f"or broadcastable [B, heads, T_action, L], got {tuple(text_mask.shape)}"
                     )
-            x = x + block.cross_attn(block.context_attn_norm(x), payload.context, ctx_mask=text_mask)
-        mlp_input = _modulate(block.ffn_norm(x), shift_mlp, scale_mlp)
-        x = block.gate(x, gate_mlp, block.ffn(mlp_input))
+            x = x + block.cross_attn(run_norm(block.context_attn_norm, x), payload.context, ctx_mask=text_mask)
+        mlp_input = _modulate(run_norm(block.ffn_norm, x), shift_mlp, scale_mlp)
+        mlp_output = run_ffn(block.ffn, mlp_input) if ffn_boundary() else block.ffn(mlp_input)
+        x = block.gate(x, gate_mlp, mlp_output)
 
         payload.x_action = x
         return astate

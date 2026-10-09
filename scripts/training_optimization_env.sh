@@ -14,11 +14,12 @@ _openwam_set_optimization_env() {
         POINTWISE_COMPILE ROPE_REAL ZERO_OVERLAP SAC_FFN LIGHTOP_NORM
         VAE_POINTWISE_COMPILE SAC_FFN_INPUT GLOBAL_COMPILE
         PARTIAL_CHECKPOINT UINT8_PREPROCESS T5_PREFIX TEXT_TRIM LINEAR_BIAS2D
+        SAC_FA SAC_FFN_FULL SAC_GEMM
     )
     # Validate before changing the environment.
     for group in "$@"; do
         case "$group" in
-            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|sac_ffn|lightop_norm|vae_pointwise|sac_ffn_input|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d) ;;
+            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|sac_ffn|lightop_norm|vae_pointwise|sac_ffn_input|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d|sac_fa|sac_ffn_full|sac_gemm) ;;
             *) echo "Unknown OpenWAM optimization group: $group" >&2; return 2 ;;
         esac
     done
@@ -26,6 +27,7 @@ _openwam_set_optimization_env() {
         export "OPENWAM_OPT_${flag}=0"
     done
     export OPENWAM_GLOBAL_COMPILE_SCOPE=all
+    unset OPENWAM_SAC_LAYERS OPENWAM_SAC_EXTRA_OPS OPENWAM_CHECKPOINT_STATS
     for group in "$@"; do
         case "$group" in
             baseline) ;;
@@ -47,6 +49,9 @@ _openwam_set_optimization_env() {
             t5_prefix) export OPENWAM_OPT_T5_PREFIX=1 ;;
             text_trim) export OPENWAM_OPT_TEXT_TRIM=1 ;;
             linear_bias2d) export OPENWAM_OPT_LINEAR_BIAS2D=1 ;;
+            sac_fa) export OPENWAM_OPT_SAC_FA=1 ;;
+            sac_ffn_full) export OPENWAM_OPT_SAC_FFN_FULL=1 ;;
+            sac_gemm) export OPENWAM_OPT_SAC_GEMM=1 ;;
         esac
     done
     return 0

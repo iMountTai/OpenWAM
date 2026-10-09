@@ -14,6 +14,10 @@ def _compiled(fn):
 
 
 def _run(fn, *args):
+    from openwam.optimizations.sac import extras_enabled, run_pointwise
+
+    if extras_enabled():
+        return run_pointwise(fn, *args)
     if torch.compiler.is_compiling() and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
         # The enclosing block already compiles this expression. A nested
         # dispatch would specialize this shared helper for every expression.

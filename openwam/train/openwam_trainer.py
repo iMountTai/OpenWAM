@@ -657,6 +657,12 @@ class OpenWAMTrainer:
     # (9) Called each step in train()'s loop — joint video-action loss dict (total/video/action).
     def compute_loss(self, batch) -> dict:
         """Compute joint video-action loss. Returns dict: total/video/action."""
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_CHECKPOINT_STATS"):
+            from openwam.optimizations.sac import begin_step
+
+            begin_step(self.accelerator.device)
         if not isinstance(batch, list):
             batch = [batch]
 
@@ -693,6 +699,12 @@ class OpenWAMTrainer:
         output_path,
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_CHECKPOINT_STATS"):
+            from openwam.optimizations.sac import report_step
+
+            report_step(global_step, self.accelerator.device, metrics, steps_per_sec, batch_size, opt_step)
         labels = [("action", "loss_action")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
