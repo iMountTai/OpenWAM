@@ -14,7 +14,7 @@ from torch import Tensor
 
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
-from openwam.optimizations.text import cached_text
+from openwam.optimizations.text import cached_text, t5_prefix_plan
 
 
 def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
@@ -36,12 +36,21 @@ def _encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Ten
         padding="max_length",
         truncation=True,
     )
+    full_length = ids.shape[1]
+    prefix = t5_prefix_plan(ids, mask, text_encoder)
+    if prefix is not None:
+        stop, cpu_lengths = prefix
+        ids = ids[:, :stop].contiguous()
+        mask = mask[:, :stop].contiguous()
     ids = ids.to(device)
     mask = mask.to(device)
     seq_lens = mask.gt(0).sum(dim=1).long()
     context = text_encoder(ids, mask)
-    for i, v in enumerate(seq_lens):
+    lengths_to_zero = seq_lens if prefix is None else cpu_lengths
+    for i, v in enumerate(lengths_to_zero):
         context[i, v:] = 0
+    if prefix is not None:
+        context = torch.nn.functional.pad(context, (0, 0, 0, full_length - context.shape[1]))
     return context, seq_lens
 
 

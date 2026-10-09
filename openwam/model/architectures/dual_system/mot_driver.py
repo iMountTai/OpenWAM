@@ -13,6 +13,7 @@ The driver owns no parameters — a plain Python class, absent from ``state_dict
 from __future__ import annotations
 
 import copy
+import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -183,6 +184,7 @@ class DualSystemMoTDriver:
         *,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
+        suppress_inner_attn_ckpt: bool = False,
     ) -> Tuple["BlockLoopState", "ActionState"]:
         """Run one mixed-attention layer.
 
@@ -206,7 +208,20 @@ class DualSystemMoTDriver:
             return self._step_checkpointed(
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
-        return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
+        if suppress_inner_attn_ckpt and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer
+
+            if "mot" in compile_scope():
+                if vstate.extras.get("vace") is not None:
+                    raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                if self._compiled_layer is None:
+                    self._compiled_layer = compile_mot_layer(self)
+                return self._compiled_layer(
+                    vstate.extras["dit"].blocks[layer_id], self.ab.blocks[layer_id], vstate, astate, attn_mask
+                )
+        return self._step_impl(
+            layer_id, vstate, astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=suppress_inner_attn_ckpt
+        )
 
     def _step_impl(
         self,
@@ -403,14 +418,26 @@ class DualSystemMoTDriver:
         # handles the resulting rectangular mask.
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
 
+        from openwam.optimizations.runtime import checkpoint_layers
+
+        checkpoint_count = checkpoint_layers(self.num_layers)
+        partial = enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT")
+        if partial and getattr(self, "_reported_checkpoint_count", None) != checkpoint_count:
+            logging.getLogger(__name__).info(
+                "[optimizations] partial checkpoint boundary=%d/%d, outer checkpoint=%s; "
+                "remaining layers have no inner attention checkpoint",
+                checkpoint_count, self.num_layers, bool(use_gradient_checkpointing and self.ab.training),
+            )
+            self._reported_checkpoint_count = checkpoint_count
         for layer_id in range(self.num_layers):
             vstate, astate = self.step(
                 layer_id,
                 vstate,
                 astate,
                 attn_mask=attn_mask,
-                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing=use_gradient_checkpointing and layer_id < checkpoint_count,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                **({"suppress_inner_attn_ckpt": True} if partial and layer_id >= checkpoint_count else {}),
             )
         return vstate, astate
 

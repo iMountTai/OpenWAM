@@ -10,6 +10,7 @@ from openwam.model.video_backbone.wan.camera_controller import SimpleAdapter
 from openwam.model.video_backbone.wan.shared.core.gradient import gradient_checkpoint_forward
 from openwam.optimizations import enabled, pointwise
 from openwam.optimizations.attention import fa2_padding
+from openwam.optimizations.linear_bias2d import video_linear
 from openwam.optimizations.norms import LayerNorm
 
 try:
@@ -207,7 +208,10 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self, x: torch.Tensor, y: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None,
+        *, linear_bias2d: bool = False,
+    ):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -215,7 +219,7 @@ class CrossAttention(nn.Module):
                 ctx_mask = ctx_mask[..., 257:]
         else:
             ctx = y
-        q = self.norm_q(self.q(x))
+        q = self.norm_q(video_linear(self.q, x) if linear_bias2d else self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
         x = self.attn(q, k, v, attn_mask=ctx_mask)
@@ -224,7 +228,7 @@ class CrossAttention(nn.Module):
             v_img = self.v_img(img)
             y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
-        return self.o(x)
+        return video_linear(self.o, x) if linear_bias2d else self.o(x)
 
 
 class GateModule(nn.Module):

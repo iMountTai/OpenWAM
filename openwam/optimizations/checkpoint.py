@@ -6,6 +6,8 @@ from contextvars import ContextVar
 import torch
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from openwam.optimizations.linear_bias2d import video_ffn
+
 
 _ffn_mode = ContextVar("openwam_ffn_checkpoint_mode", default=None)
 
@@ -54,11 +56,11 @@ def run_ffn(ffn, x):
         return _eager_run_ffn(ffn, x)
     mode = _ffn_mode.get()
     if mode is None:
-        return ffn(x)
+        return video_ffn(ffn, x)
     # Keep attention, normalization and compiled pointwise dispatch unchanged.
     # Standard SAC still owns the cache and checks for mutated saved outputs.
     with mode:
-        return ffn(x)
+        return video_ffn(ffn, x)
 
 
 _eager_run_ffn = torch.compiler.disable(run_ffn)

@@ -42,6 +42,7 @@ from openwam.model.video_backbone.wan.preprocess import (
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 from openwam.optimizations import enabled
+from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 
 logger = logging.getLogger(__name__)
 
@@ -542,9 +543,9 @@ class WanBase(VideoBackbone):
         attn_input = modulate(block.norm1(state.hidden_states), shift_msa, scale_msa)
 
         self_attn = block.self_attn
-        q = self_attn.norm_q(self_attn.q(attn_input))
-        k = self_attn.norm_k(self_attn.k(attn_input))
-        v = self_attn.v(attn_input)
+        q = self_attn.norm_q(video_linear(self_attn.q, attn_input))
+        k = self_attn.norm_k(video_linear(self_attn.k, attn_input))
+        v = video_linear(self_attn.v, attn_input)
         q = rope_apply(q, state.rope_freqs, self_attn.num_heads)
         k = rope_apply(k, state.rope_freqs, self_attn.num_heads)
 
@@ -577,12 +578,13 @@ class WanBase(VideoBackbone):
         self_attn = block.self_attn
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
-        hidden_states = block.gate(residual_x, gate_msa, self_attn.o(attn_out))
+        hidden_states = block.gate(residual_x, gate_msa, video_linear(self_attn.o, attn_out))
         context_mask = None
         if state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
         hidden_states = hidden_states + block.cross_attn(
-            block.norm3(hidden_states), state.context, ctx_mask=context_mask
+            block.norm3(hidden_states), state.context, ctx_mask=context_mask,
+            **cross_attention_kwargs(block.cross_attn),
         )
         mlp_input = modulate(block.norm2(hidden_states), shift_mlp, scale_mlp)
         if enabled("OPENWAM_OPT_SAC_FFN"):
@@ -590,7 +592,7 @@ class WanBase(VideoBackbone):
 
             mlp_output = run_ffn(block.ffn, mlp_input)
         else:
-            mlp_output = block.ffn(mlp_input)
+            mlp_output = video_ffn(block.ffn, mlp_input)
         hidden_states = block.gate(hidden_states, gate_mlp, mlp_output)
         state.hidden_states = hidden_states
 

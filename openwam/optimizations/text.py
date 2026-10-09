@@ -11,11 +11,123 @@ from openwam.optimizations import enabled
 logger = logging.getLogger(__name__)
 
 
+def frozen_eval(encoder):
+    return not any(m.training for m in encoder.modules()) and not any(p.requires_grad for p in encoder.parameters())
+
+
+def _native_t5_forward(module):
+    forward = module.forward
+    if getattr(module, "_openwam_no_grad_wrapped", False):
+        from openwam.model.architectures.base import _wrap_single_forward
+
+        code = getattr(forward, "__code__", None)
+        if (not any(code is value for value in _wrap_single_forward.__code__.co_consts
+                    if getattr(value, "co_name", None) == "wrapped")
+                or getattr(forward, "__globals__", None) is not _wrap_single_forward.__globals__
+                or code.co_freevars != ("original_forward",)):
+            return False
+        closure = getattr(forward, "__closure__", None)
+        if not closure or len(closure) != 1:
+            return False
+        try:
+            original = closure[0].cell_contents
+        except ValueError:
+            return False
+        if getattr(forward, "__wrapped__", None) is not original:
+            return False
+        forward = original
+    return (getattr(forward, "__self__", None) is module
+            and getattr(forward, "__func__", None) is type(module).forward)
+
+
+def _native_t5(encoder):
+    from openwam.model.video_backbone.wan.models import text_encoder as native
+
+    kinds = (
+        native.WanTextEncoder, native.T5Attention, native.T5FeedForward, native.T5LayerNorm,
+        native.T5RelativeEmbedding, native.T5SelfAttention, native.GELU,
+        torch.nn.Embedding, torch.nn.Linear, torch.nn.Dropout, torch.nn.ModuleList, torch.nn.Sequential,
+    )
+    hooks = ("_forward_pre_hooks", "_forward_hooks", "_backward_pre_hooks", "_backward_hooks")
+    if type(encoder) is not native.WanTextEncoder:
+        return False
+    if any(getattr(torch.nn.modules.module, "_global" + name, None) for name in hooks):
+        return False
+    return all(type(module) in kinds and _native_t5_forward(module)
+               and getattr(module, "_compiled_call_impl", None) is None
+               and not any(getattr(module, name, None) for name in hooks) for module in encoder.modules())
+
+
+def t5_prefix_plan(ids, mask, text_encoder):
+    """Return a CPU right-padding plan for the native frozen T5, or None."""
+    if not enabled("OPENWAM_OPT_T5_PREFIX") or not frozen_eval(text_encoder):
+        return None
+    if (not _native_t5(text_encoder) or ids.device.type != "cpu" or mask.device.type != "cpu"
+            or ids.ndim != 2 or mask.shape != ids.shape or not ids.shape[0] or not ids.shape[1]):
+        return None
+    if not bool(((mask == 0) | (mask == 1)).all()):
+        return None
+    keep = mask > 0
+    lengths = keep.sum(dim=1, dtype=torch.long)
+    positions = torch.arange(ids.shape[1]).unsqueeze(0)
+    if not torch.equal(keep, positions < lengths.unsqueeze(1)):
+        return None
+    maximum = int(lengths.max())
+    # Keep the original all-empty route: T5 implementations need a nonempty axis.
+    if maximum == 0 or maximum == ids.shape[1]:
+        return None
+    return maximum, lengths.tolist()
+
+
+def trim_text_context(inputs):
+    """Crop only the batch's common masked tail, before any proprio append."""
+    if not enabled("OPENWAM_OPT_TEXT_TRIM"):
+        return inputs
+    context = inputs.get("context")
+    if not isinstance(context, torch.Tensor) or context.ndim != 3 or context.shape[1] <= 1:
+        return inputs
+    mask = inputs.get("context_mask")
+    lengths = inputs.get("seq_lens")
+    if mask is not None:
+        # A custom/additive or query-dependent mask is not a pure padding mask.
+        if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool or mask.shape != context.shape[:2]:
+            return inputs
+        keep_cpu = mask.detach().to(device="cpu")
+        columns = keep_cpu.any(dim=0).nonzero(as_tuple=False).flatten()
+        stop = int(columns[-1]) + 1 if columns.numel() else 1
+    elif isinstance(lengths, torch.Tensor) and lengths.shape == (context.shape[0],):
+        if lengths.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            return inputs
+        lengths_cpu = lengths.detach().to(device="cpu")
+        if lengths_cpu.numel() == 0 or bool(((lengths_cpu < 0) | (lengths_cpu > context.shape[1])).any()):
+            return inputs
+        stop = max(1, int(lengths_cpu.max()))
+    else:
+        return inputs
+    if stop >= context.shape[1]:
+        return inputs
+    # If both representations exist, retain their range invariant. seq_lens
+    # stays unchanged, and an explicit mask remains the source of visibility.
+    if isinstance(lengths, torch.Tensor):
+        if lengths.shape != (context.shape[0],):
+            return inputs
+        lengths_cpu = lengths.detach().to(device="cpu")
+        if bool(((lengths_cpu < 0) | (lengths_cpu > stop)).any()):
+            return inputs
+    result = dict(inputs)
+    result["context"] = context[:, :stop].contiguous()
+    if mask is not None:
+        result["context_mask"] = mask[:, :stop].contiguous()
+    # Keep one masked slot for all-empty batches, so native attention never
+    # receives a zero-length KV axis. No valid token or interior hole is removed.
+    return result
+
+
 def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
     if not enabled("OPENWAM_OPT_TEXT_CACHE"):
         return encode(prompts)
     params = tuple(text_encoder.parameters())
-    if any(module.training for module in text_encoder.modules()) or any(p.requires_grad for p in params):
+    if not frozen_eval(text_encoder):
         if not getattr(text_encoder, "_openwam_cache_skip_warned", False):
             logger.warning("[optimizations] text cache skipped: encoder must be frozen and in eval mode")
             text_encoder._openwam_cache_skip_warned = True
@@ -23,7 +135,8 @@ def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
     capacity = int(os.environ.get("OPENWAM_TEXT_CACHE_SIZE", "32"))
     if capacity <= 0:
         raise ValueError("OPENWAM_TEXT_CACHE_SIZE must be positive")
-    signature = (id(tokenizer), str(device), tuple((p.data_ptr(), p._version, p.dtype, p.device) for p in params))
+    signature = (id(tokenizer), str(device), enabled("OPENWAM_OPT_T5_PREFIX"),
+                 tuple((p.data_ptr(), p._version, p.dtype, p.device) for p in params))
     if signature != getattr(text_encoder, "_openwam_text_cache_signature", None):
         text_encoder._openwam_text_cache_signature = signature
         text_encoder._openwam_text_cache = OrderedDict()

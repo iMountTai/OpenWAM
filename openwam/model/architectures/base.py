@@ -529,6 +529,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # Always strip the internal routing key so it doesn't leak into downstream forwards,
         # even when proprio context is globally disabled.
         pipeline_inputs = dict(pipeline_inputs)
+        from openwam.optimizations.text import trim_text_context
+
+        pipeline_inputs = trim_text_context(pipeline_inputs)
         sample_mask = pipeline_inputs.pop("_proprio_sample_mask", None)
 
         if not bool(getattr(self, "_use_proprioception_context", False)):
