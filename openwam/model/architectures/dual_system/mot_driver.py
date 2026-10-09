@@ -209,11 +209,12 @@ class DualSystemMoTDriver:
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
         if suppress_inner_attn_ckpt and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
-            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer, mark_mot_text_dynamic
 
             if "mot" in compile_scope():
                 if vstate.extras.get("vace") is not None:
                     raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                mark_mot_text_dynamic(vstate, astate)
                 if self._compiled_layer is None:
                     self._compiled_layer = compile_mot_layer(self)
                 return self._compiled_layer(
@@ -326,11 +327,12 @@ class DualSystemMoTDriver:
         outer_payload = astate.payload
         compiled = None
         if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
-            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer, mark_mot_text_dynamic
 
             if "mot" in compile_scope():
                 if vstate.extras.get("vace") is not None:
                     raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                mark_mot_text_dynamic(vstate, astate)
                 if self._compiled_layer is None:
                     self._compiled_layer = compile_mot_layer(self)
                 compiled = self._compiled_layer
