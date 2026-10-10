@@ -10,7 +10,11 @@ CACHE_T = 2
 
 
 def _layout(x):
-    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
+    if enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR") and x.ndim == 5:
+        from openwam.optimizations.vae_layout import channels_last
+
+        return channels_last(x)
+    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") or enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR"):
         if x.ndim == 5:
             return x.contiguous(memory_format=torch.channels_last_3d)
         if x.ndim == 4:
@@ -19,7 +23,7 @@ def _layout(x):
 
 
 def _clone_cache(x):
-    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") and x.ndim == 5:
+    if (enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") or enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR")) and x.ndim == 5:
         return x.clone(memory_format=torch.channels_last_3d)
     return x.clone()
 
@@ -240,9 +244,13 @@ class ResidualBlock(nn.Module):
                 x = pointwise.vae_normalize(
                     x, layer.gamma, layer.bias, 1 if layer.channel_first else -1, layer.scale, apply_silu=True
                 )
+                if enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR"):
+                    x = _layout(x)
                 skip_silu = True
                 continue
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
+                if enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR"):
+                    x = _layout(x)
                 idx = feat_idx[0]
                 cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
@@ -255,7 +263,10 @@ class ResidualBlock(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
-        return x + h, feat_cache, feat_idx
+        result = x + h
+        if enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR"):
+            result = _layout(result)
+        return result, feat_cache, feat_idx
 
 
 class AttentionBlock(nn.Module):

@@ -398,7 +398,17 @@ class OpenWAMTrainer:
         # different ranks at the same step keep in-batch timestep diversity.
         # Gated on _run_seed so unseeded production runs stay fully stochastic.
         prof_context = self._build_profiler(output_path)
-        with prof_context as prof:
+        from openwam.optimizations import enabled
+
+        online = None
+        if enabled("OPENWAM_OPT_ONLINE_ENCODE"):
+            from openwam.optimizations.online_encode import OnlineEncoder
+
+            online = OnlineEncoder(
+                self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
+                num_workers=dataloader.num_workers, gradient_accumulation_steps=grad_accum,
+            )
+        with prof_context as prof, online if online is not None else contextlib.nullcontext():
             epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
             for epoch in epochs:
                 if hasattr(dataloader, "set_epoch"):
@@ -412,6 +422,10 @@ class OpenWAMTrainer:
                     epoch_iter = skip_first_batches(dataloader, skip_first)
                 else:
                     epoch_iter = dataloader
+                if online is not None:
+                    epoch_iter = online.batches(
+                        epoch_iter, global_step=global_step, max_steps=max_steps, save_steps=save_steps,
+                    )
                 for batch in epoch_iter:
                     if self._run_seed is not None:
                         step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
@@ -621,6 +635,12 @@ class OpenWAMTrainer:
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
         arch.move_frozen_to_device(self.accelerator.device)
         prepare_runtime_constants(arch)
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
+            from openwam.optimizations.zero import install_reduce_scatter
+
+            install_reduce_scatter(self.architecture.optimizer)
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,
@@ -663,10 +683,14 @@ class OpenWAMTrainer:
             from openwam.optimizations.sac import begin_step
 
             begin_step(self.accelerator.device)
-        if not isinstance(batch, list):
-            batch = [batch]
+        from openwam.optimizations.online_encode import PreparedInputs
 
-        inputs = self.architecture.prepare_inputs(batch)
+        if isinstance(batch, PreparedInputs):
+            inputs = batch.values
+        else:
+            if not isinstance(batch, list):
+                batch = [batch]
+            inputs = self.architecture.prepare_inputs(batch)
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
 

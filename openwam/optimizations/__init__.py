@@ -25,6 +25,9 @@ SWITCHES = (
     "OPENWAM_OPT_SAC_FA",
     "OPENWAM_OPT_SAC_FFN_FULL",
     "OPENWAM_OPT_SAC_GEMM",
+    "OPENWAM_OPT_VAE_LAYOUT_REPAIR",
+    "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
+    "OPENWAM_OPT_ONLINE_ENCODE",
 )
 
 
@@ -50,6 +53,10 @@ def configure_backends() -> None:
     from openwam.optimizations.sac import validate
 
     validate()
+    if flags["OPENWAM_OPT_VAE_LAYOUT_REPAIR"]:
+        from openwam.optimizations.vae_layout import validate as validate_layout
+
+        validate_layout()
     if flags["OPENWAM_OPT_GLOBAL_COMPILE"]:
         from openwam.optimizations.global_compile import compile_scope
 
@@ -61,7 +68,7 @@ def configure_backends() -> None:
             from openwam.optimizations.norms import lightop_ops
 
             lightop_ops()
-    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
+    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"] or flags["OPENWAM_OPT_VAE_LAYOUT_REPAIR"]:
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
     if os.environ.get("RANK", "0") == "0":
@@ -71,6 +78,13 @@ def configure_backends() -> None:
 
 
 def configure_zero(config: dict) -> None:
+    if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER") or enabled("OPENWAM_OPT_ONLINE_ENCODE"):
+        zero = config["zero_optimization"]
+        if zero.get("stage") != 2:
+            raise ValueError("ReduceScatter and online encoding currently require ZeRO-2")
+        if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
+            zero.update(reduce_scatter=True, contiguous_gradients=True, use_multi_rank_bucket_allreduce=True,
+                        overlap_comm=True)
     if enabled("OPENWAM_OPT_ZERO_OVERLAP"):
         zero = config["zero_optimization"]
         zero.update(overlap_comm=True, contiguous_gradients=True)
@@ -92,7 +106,7 @@ def prepare_model(architecture) -> None:
     if enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT"):
         if type(architecture).__name__ != "DualSystemSelfAttnArchitecture":
             raise ValueError("OPENWAM_OPT_PARTIAL_CHECKPOINT currently requires dual_system/joint_self_attn")
-    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST")
+    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") or enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR")
     compile_vae = False
     if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
         from openwam.optimizations.global_compile import compile_scope
