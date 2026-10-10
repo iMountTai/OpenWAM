@@ -104,8 +104,10 @@ def _average_tensor(self, tensor, communication_data_type):
     cursor = 0
     for group_id, param_index, param_id in bucket.params:
         param = self.bit16_groups[group_id][param_index]
+        # DeepSpeed may store integral partition offsets as floats. Normalize
+        # before arithmetic so both narrow's start and length remain integers.
         partitions = sorted(
-            (self.grad_start_offset[group_id][owner][param_id], owner)
+            (int(self.grad_start_offset[group_id][owner][param_id]), owner)
             for owner in self.param_to_partition_ids[group_id][param_id]
         )
         for index, (offset, owner) in enumerate(partitions):

@@ -25,7 +25,6 @@ SWITCHES = (
     "OPENWAM_OPT_SAC_FA",
     "OPENWAM_OPT_SAC_FFN_FULL",
     "OPENWAM_OPT_SAC_GEMM",
-    "OPENWAM_OPT_VAE_LAYOUT_REPAIR",
     "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
     "OPENWAM_OPT_ONLINE_ENCODE",
 )
@@ -53,7 +52,7 @@ def configure_backends() -> None:
     from openwam.optimizations.sac import validate
 
     validate()
-    if flags["OPENWAM_OPT_VAE_LAYOUT_REPAIR"]:
+    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
         from openwam.optimizations.vae_layout import validate as validate_layout
 
         validate_layout()
@@ -68,7 +67,7 @@ def configure_backends() -> None:
             from openwam.optimizations.norms import lightop_ops
 
             lightop_ops()
-    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"] or flags["OPENWAM_OPT_VAE_LAYOUT_REPAIR"]:
+    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
         os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
     if os.environ.get("RANK", "0") == "0":
@@ -106,7 +105,7 @@ def prepare_model(architecture) -> None:
     if enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT"):
         if type(architecture).__name__ != "DualSystemSelfAttnArchitecture":
             raise ValueError("OPENWAM_OPT_PARTIAL_CHECKPOINT currently requires dual_system/joint_self_attn")
-    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") or enabled("OPENWAM_OPT_VAE_LAYOUT_REPAIR")
+    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST")
     compile_vae = False
     if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
         from openwam.optimizations.global_compile import compile_scope
