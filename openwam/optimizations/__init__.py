@@ -14,10 +14,8 @@ SWITCHES = (
     "OPENWAM_OPT_POINTWISE_COMPILE",
     "OPENWAM_OPT_ROPE_REAL",
     "OPENWAM_OPT_ZERO_OVERLAP",
-    "OPENWAM_OPT_SAC_FFN",
     "OPENWAM_OPT_LIGHTOP_NORM",
     "OPENWAM_OPT_VAE_POINTWISE_COMPILE",
-    "OPENWAM_OPT_SAC_FFN_INPUT",
     "OPENWAM_OPT_GLOBAL_COMPILE",
     "OPENWAM_OPT_PARTIAL_CHECKPOINT",
     "OPENWAM_OPT_UINT8_PREPROCESS",
@@ -56,8 +54,6 @@ def configure_backends() -> None:
         from openwam.optimizations.global_compile import compile_scope
 
         compile_scope()
-    if flags["OPENWAM_OPT_SAC_FFN_INPUT"] and not flags["OPENWAM_OPT_SAC_FFN"]:
-        raise ValueError("OPENWAM_OPT_SAC_FFN_INPUT=1 requires OPENWAM_OPT_SAC_FFN=1")
     if flags["OPENWAM_OPT_LIGHTOP_NORM"]:
         import torch
 

@@ -41,7 +41,6 @@ from openwam.model.video_backbone.wan.preprocess import (
     check_resize_height_width,
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
-from openwam.optimizations import enabled
 from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 
 logger = logging.getLogger(__name__)
@@ -593,10 +592,6 @@ class WanBase(VideoBackbone):
         mlp_input = modulate(run_norm(block.norm2, hidden_states), shift_mlp, scale_mlp)
         if ffn_boundary():
             mlp_output = run_complete_ffn(block.ffn, mlp_input, video=True)
-        elif enabled("OPENWAM_OPT_SAC_FFN"):
-            from openwam.optimizations.checkpoint import run_ffn
-
-            mlp_output = run_ffn(block.ffn, mlp_input)
         else:
             mlp_output = video_ffn(block.ffn, mlp_input)
         hidden_states = block.gate(hidden_states, gate_mlp, mlp_output)

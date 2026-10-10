@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from openwam.optimizations import enabled
+from openwam.optimizations.sac import dispatcher
 
 
 def _has_hooks(module):
@@ -54,6 +55,7 @@ def can_use_bias2d(linear, x):
     return arch == "gfx936"
 
 
+@dispatcher
 def video_linear(linear, x):
     from openwam.optimizations.sac import projection_boundary, run_video_projection
 

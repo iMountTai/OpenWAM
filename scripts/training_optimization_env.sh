@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Source this file before the existing torchrun command. Each invocation resets
-# optimization settings, then enables only the named groups. PARTIAL_CHECKPOINT
-# is a layer count; zero keeps checkpointing on all layers when configured.
+# optimization settings, then enables only the named groups. Two groups take a
+# layer count: partial_checkpoint[=M] removes checkpointing from the trailing M
+# layers (default 16); sac_ffn_full[=N] keeps complete FFNs for the trailing N
+# checkpointed layers (default: all of them). For example:
+#   source scripts/training_optimization_env.sh ... sac_ffn_full partial_checkpoint=2
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     echo 'Usage: source scripts/training_optimization_env.sh baseline|<group> [<group> ...]' >&2
     exit 2
@@ -11,15 +14,21 @@ _openwam_set_optimization_env() {
     local flag group
     local -a flags=(
         VAE_CHANNELS_LAST CONSTANT_CACHE TEXT_CACHE FA2_PADDING MOT_SPLIT_ATTN
-        POINTWISE_COMPILE ROPE_REAL ZERO_OVERLAP SAC_FFN LIGHTOP_NORM
-        VAE_POINTWISE_COMPILE SAC_FFN_INPUT GLOBAL_COMPILE
+        POINTWISE_COMPILE ROPE_REAL ZERO_OVERLAP LIGHTOP_NORM
+        VAE_POINTWISE_COMPILE GLOBAL_COMPILE
         PARTIAL_CHECKPOINT UINT8_PREPROCESS T5_PREFIX TEXT_TRIM LINEAR_BIAS2D
         SAC_FA SAC_FFN_FULL SAC_GEMM
     )
     # Validate before changing the environment.
     for group in "$@"; do
         case "$group" in
-            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|sac_ffn|lightop_norm|vae_pointwise|sac_ffn_input|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d|sac_fa|sac_ffn_full|sac_gemm) ;;
+            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|lightop_norm|vae_pointwise|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d|sac_fa|sac_ffn_full|sac_gemm) ;;
+            partial_checkpoint=*|sac_ffn_full=*)
+                if [[ ! "${group#*=}" =~ ^[0-9]+$ ]]; then
+                    echo "Layer count must be a non-negative integer: $group" >&2; return 2
+                fi ;;
+            sac_ffn|sac_ffn_input)
+                echo "$group was removed; use sac_ffn_full[=N]" >&2; return 2 ;;
             *) echo "Unknown OpenWAM optimization group: $group" >&2; return 2 ;;
         esac
     done
@@ -28,6 +37,7 @@ _openwam_set_optimization_env() {
     done
     export OPENWAM_GLOBAL_COMPILE_SCOPE=all
     unset OPENWAM_SAC_LAYERS OPENWAM_SAC_EXTRA_OPS OPENWAM_CHECKPOINT_STATS
+    unset OPENWAM_OPT_SAC_FFN OPENWAM_OPT_SAC_FFN_INPUT
     for group in "$@"; do
         case "$group" in
             baseline) ;;
@@ -38,19 +48,19 @@ _openwam_set_optimization_env() {
             mot_attention) export OPENWAM_OPT_MOT_SPLIT_ATTN=1 ;;
             pointwise) export OPENWAM_OPT_POINTWISE_COMPILE=1 ;;
             rope_real) export OPENWAM_OPT_ROPE_REAL=1 ;;
-            sac_ffn) export OPENWAM_OPT_SAC_FFN=1 ;;
             lightop_norm) export OPENWAM_OPT_LIGHTOP_NORM=1 ;;
             vae_pointwise) export OPENWAM_OPT_VAE_POINTWISE_COMPILE=1 ;;
-            sac_ffn_input) export OPENWAM_OPT_SAC_FFN=1 OPENWAM_OPT_SAC_FFN_INPUT=1 ;;
             global_compile) export OPENWAM_OPT_GLOBAL_COMPILE=1 ;;
             zero_overlap) export OPENWAM_OPT_ZERO_OVERLAP=1 ;;
             partial_checkpoint) export OPENWAM_OPT_PARTIAL_CHECKPOINT=16 ;;
+            partial_checkpoint=*) export OPENWAM_OPT_PARTIAL_CHECKPOINT="${group#*=}" ;;
             uint8_preprocess) export OPENWAM_OPT_UINT8_PREPROCESS=1 ;;
             t5_prefix) export OPENWAM_OPT_T5_PREFIX=1 ;;
             text_trim) export OPENWAM_OPT_TEXT_TRIM=1 ;;
             linear_bias2d) export OPENWAM_OPT_LINEAR_BIAS2D=1 ;;
             sac_fa) export OPENWAM_OPT_SAC_FA=1 ;;
             sac_ffn_full) export OPENWAM_OPT_SAC_FFN_FULL=1 ;;
+            sac_ffn_full=*) export OPENWAM_OPT_SAC_FFN_FULL=1 OPENWAM_SAC_LAYERS="${group#*=}" ;;
             sac_gemm) export OPENWAM_OPT_SAC_GEMM=1 ;;
         esac
     done

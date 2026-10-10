@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from openwam.optimizations import enabled
+from openwam.optimizations.sac import dispatcher
 
 
 @lru_cache(maxsize=None)
@@ -13,6 +14,7 @@ def _compiled(fn):
     return torch.compile(fn, dynamic=True, fullgraph=True)
 
 
+@dispatcher
 def _run(fn, *args):
     from openwam.optimizations.sac import extras_enabled, run_pointwise
 

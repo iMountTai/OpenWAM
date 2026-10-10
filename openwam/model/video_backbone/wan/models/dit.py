@@ -12,7 +12,7 @@ from openwam.optimizations import enabled, pointwise
 from openwam.optimizations.attention import fa2_padding
 from openwam.optimizations.linear_bias2d import video_linear
 from openwam.optimizations.norms import LayerNorm
-from openwam.optimizations.sac import extras_enabled, run_attention, run_norm, run_projection
+from openwam.optimizations.sac import dispatcher, extras_enabled, run_attention, run_norm, run_projection
 
 try:
     import flash_attn_interface
@@ -47,6 +47,7 @@ def fused_backend_name() -> str:
     return "torch_sdpa"
 
 
+@dispatcher
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,

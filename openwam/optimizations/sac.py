@@ -3,6 +3,10 @@
 Each checkpoint owns its standard forward/recompute modes. Only explicit eager
 operator regions enter those modes; unselected compiled regions keep their path.
 No activation cache, backward implementation or parameter replacement lives here.
+
+Policies apply to the trailing OPENWAM_SAC_LAYERS of the checkpointed layers.
+Layers without checkpointing (OPENWAM_OPT_PARTIAL_CHECKPOINT) keep their
+activations through autograd, so SAC never caches them a second time.
 """
 
 import json
@@ -19,7 +23,7 @@ from torch.utils import checkpoint as torch_checkpoint
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from openwam.optimizations import enabled
-from openwam.optimizations.runtime import checkpoint_skip_layers, integer
+from openwam.optimizations.runtime import checkpoint_layers, checkpoint_skip_layers, integer
 
 
 FLAGS = ("OPENWAM_OPT_SAC_FA", "OPENWAM_OPT_SAC_FFN_FULL", "OPENWAM_OPT_SAC_GEMM")
@@ -29,6 +33,23 @@ _regions = ContextVar("openwam_sac_regions", default=())
 _inside_mode = ContextVar("openwam_inside_sac_mode", default=False)
 _native_mot = ContextVar("openwam_sac_native_mot_expression", default=False)
 _counts = Counter()
+
+
+def dispatcher(fn):
+    """Let Dynamo inline a thin dispatcher, but never compile it as its own frame.
+
+    A graph break inside an inlined dispatcher makes Dynamo compile the
+    dispatcher separately, guarded on the callable argument. Every attention
+    callable or per-layer module then recompiles it until recompile_limit.
+    """
+    try:
+        from torch._dynamo.eval_frame import skip_code
+    except ImportError:
+        logger.warning("[optimizations] torch._dynamo skip_code is unavailable; SAC dispatchers may recompile")
+        return fn
+    skip_code(fn.__code__)
+    return fn
+
 
 _FA_OPS = frozenset((
     "flash_attn._flash_attn_forward.default", "flash_attn2_c_op.varlen_fwd.default",
@@ -87,22 +108,32 @@ def _extra_ops(raw):
 
 
 def layers(total):
+    """SAC layer count; unset covers every checkpointed layer."""
+    checkpointed = checkpoint_layers(total)
     if not os.environ.get("OPENWAM_SAC_LAYERS", "").strip():
-        return total
-    count = integer("OPENWAM_SAC_LAYERS", total)
-    if count > total:
-        raise ValueError(f"OPENWAM_SAC_LAYERS={count} exceeds model layers={total}")
+        return checkpointed
+    count = integer("OPENWAM_SAC_LAYERS", checkpointed)
+    if count > checkpointed:
+        raise ValueError(
+            f"OPENWAM_SAC_LAYERS={count} exceeds checkpointed layers={checkpointed} "
+            f"(model layers={total}, OPENWAM_OPT_PARTIAL_CHECKPOINT={total - checkpointed})"
+        )
     return count
+
+
+def layer_range(total):
+    """Half-open layer range [start, stop) covered by SAC: the checkpointed tail."""
+    stop = checkpoint_layers(total)
+    return stop - layers(total), stop
 
 
 def validate(total=None):
     enabled("OPENWAM_CHECKPOINT_STATS")
+    for name in ("OPENWAM_OPT_SAC_FFN", "OPENWAM_OPT_SAC_FFN_INPUT"):
+        if enabled(name):
+            raise ValueError(f"{name} was removed; use OPENWAM_OPT_SAC_FFN_FULL=1 with OPENWAM_SAC_LAYERS=N")
     if not active():
         return
-    if checkpoint_skip_layers():
-        raise ValueError("SAC and OPENWAM_OPT_PARTIAL_CHECKPOINT are alternative experiments; set the latter to 0")
-    if enabled("OPENWAM_OPT_SAC_FFN") or enabled("OPENWAM_OPT_SAC_FFN_INPUT"):
-        raise ValueError("Disable legacy SAC_FFN/SAC_FFN_INPUT when testing the complete SAC policies")
     if total is not None:
         layers(total)
         _extra_ops(os.environ.get("OPENWAM_SAC_EXTRA_OPS", ""))
@@ -141,9 +172,10 @@ def prepare(architecture):
                 op = getattr(entry, "default", entry)
                 if getattr(getattr(op, "_schema", None), "name", None) != name:
                     raise ValueError(f"FA SAC requires registered forward op {name}, got {entry}")
+    start, stop = layer_range(backbone.num_layers)
     logger.info(
-        "[optimizations] standard SAC flags=%s, trailing layers=%d/%d, extra ops=%s",
-        {name: enabled(name) for name in FLAGS}, layers(backbone.num_layers), backbone.num_layers,
+        "[optimizations] standard SAC flags=%s, layers=[%d, %d) of %d, no-checkpoint tail=%d, extra ops=%s",
+        {name: enabled(name) for name in FLAGS}, start, stop, backbone.num_layers, backbone.num_layers - stop,
         sorted(_extra_ops(os.environ.get("OPENWAM_SAC_EXTRA_OPS", ""))),
     )
 
@@ -201,8 +233,9 @@ def _checkpoint_scope(mode, phase, policy):
 
 
 def context_fn(layer_id, total):
-    """Create fresh standard caches for the trailing configured layers."""
-    selected = active() and layer_id >= total - layers(total)
+    """Create fresh standard caches for the configured checkpointed layers."""
+    start, stop = layer_range(total) if active() else (0, 0)
+    selected = start <= layer_id < stop
 
     def contexts():
         if selected:
@@ -257,18 +290,21 @@ def _invoke(region, fn, *args, **kwargs):
 _eager_invoke = torch.compiler.disable(_invoke)
 
 
+@dispatcher
 def _call(region, fn, *args, **kwargs):
-    if torch.compiler.is_compiling():
-        return _eager_invoke(region, fn, *args, **kwargs)
-    return _invoke(region, fn, *args, **kwargs)
+    # Always disabled: a region that reaches this frame eagerly, e.g. after a
+    # recompile-limit fallback, must not let Dynamo trace the SAC region.
+    return _eager_invoke(region, fn, *args, **kwargs)
 
 
+@dispatcher
 def run_attention(fn, *args, label="attention", **kwargs):
     if not attention_boundary():
         return fn(*args, **kwargs)
     return _call(label, fn, *args, **kwargs)
 
 
+@dispatcher
 def run_ffn(ffn, x, *, video=False):
     if video:
         from openwam.optimizations.linear_bias2d import video_ffn
@@ -277,24 +313,28 @@ def run_ffn(ffn, x, *, video=False):
     return _call("action_ffn", ffn, x)
 
 
+@dispatcher
 def run_projection(linear, x):
     if not projection_boundary():
         return linear(x)
     return _call("projection", linear, x)
 
 
+@dispatcher
 def run_video_projection(linear, x):
     from openwam.optimizations.linear_bias2d import _video_linear
 
     return _call("projection", _video_linear, linear, x)
 
 
+@dispatcher
 def run_norm(norm, x):
     if not extras_enabled():
         return norm(x)
     return _call("norm", norm, x)
 
 
+@dispatcher
 def run_pointwise(fn, *args):
     return _call("pointwise", fn, *args)
 
