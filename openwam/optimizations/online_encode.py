@@ -1,4 +1,4 @@
-"""One real batch of lookahead encoding during ZeRO-2 parameter AllGather."""
+"""One real batch of lookahead encoding during the ZeRO-2 parameter AllGather."""
 
 import functools
 import inspect
@@ -19,24 +19,15 @@ class PreparedInputs:
     values: dict
 
 
-def _record_stream(value, stream):
-    if isinstance(value, torch.Tensor):
-        if value.is_cuda:
-            value.record_stream(stream)
-    elif isinstance(value, dict):
-        for item in value.values():
-            _record_stream(item, stream)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _record_stream(item, stream)
-
-
 class OnlineEncoder:
-    """Instance-local gather replacement; no threads, replay, or disk cache.
+    """Instance-local gather replacement; no threads, side streams, replay, or disk cache.
 
-    The producer event precedes communication. Encoding waits for the producer,
-    while the training stream waits for communication only after encoding has
-    been enqueued. Waiting for encoded inputs happens at the next consumer.
+    The AllGather is launched asynchronously, the next batch is encoded on the
+    training stream, and only then does the training stream wait for the
+    collective. Encoding runs on the compute units while RCCL gathers the
+    updated parameters. Frozen encoders are not in the gathered groups, so the
+    encode never reads a buffer the collective writes. A single stream keeps
+    one allocator pool and needs no events or record_stream.
     """
 
     def __init__(self, architecture, optimizer, *, num_workers, gradient_accumulation_steps):
@@ -56,11 +47,9 @@ class OnlineEncoder:
             raise ValueError("Online encoding requires gradient accumulation=1 and DataLoader workers>0")
         # Worker-side random transforms keep their own RNG/order. Native TI2V
         # preprocessing uses the VAE mean and no random draws; training noise
-        # and timesteps remain in compute_loss on the original training stream.
+        # and timesteps remain in compute_loss after the per-step seed.
         self.architecture = architecture
         self.optimizer = optimizer
-        self.device = architecture.device
-        self.stream = torch.cuda.Stream(device=self.device)
         self.pending = None
         self.next_batch = None
         self.original_step = optimizer.step
@@ -88,10 +77,7 @@ class OnlineEncoder:
     def __exit__(self, *exc):
         self.optimizer.step = self.original_step
         self.next_batch = None
-        try:
-            self.stream.synchronize()
-        finally:
-            self.pending = None
+        self.pending = None
 
     def _gather(self, groups_flat, partitioned_param_groups, dp_process_group,
                 start_alignment_factor, allgather_bucket_size):
@@ -99,44 +85,37 @@ class OnlineEncoder:
             return self.original_gather(groups_flat, partitioned_param_groups, dp_process_group,
                                         start_alignment_factor, allgather_bucket_size)
         take, self.next_batch = self.next_batch, None
-        # Fetch before launching collectives: an exhausted/broken iterator must
-        # not leave this rank with outstanding communication work.
-        batch = take()
-        producer = torch.cuda.current_stream(self.device)
-        ready = torch.cuda.Event()
-        ready.record(producer)  # Includes any DataLoader device transfer.
         works = []
         try:
             for flat, parts, group in zip(groups_flat, partitioned_param_groups, dp_process_group):
                 if dist.get_world_size(group) > 1:
                     works.append(dist.all_gather_into_tensor(
                         flat, parts[dist.get_rank(group)], group=group, async_op=True))
-            with torch.cuda.stream(self.stream), torch.no_grad():
-                self.stream.wait_event(ready)
-                _record_stream(batch, self.stream)
+            # The collective has captured its dependency on the optimizer update;
+            # everything enqueued below runs on the compute stream alongside it.
+            batch = take()
+            with torch.no_grad():
                 values = self.architecture.prepare_inputs(batch if isinstance(batch, list) else [batch])
-                encoded = torch.cuda.Event()
-                encoded.record(self.stream)
-                self.pending = (PreparedInputs(values), encoded, batch)
+            self.pending = PreparedInputs(values)
         finally:
-            # NCCL/RCCL Work.wait creates a consumer-stream dependency. This
-            # wait must come AFTER the independent encoding has been enqueued.
+            # Work.wait makes the training stream wait for the gathered
+            # parameters; it must follow the encode so the two overlap. It also
+            # runs if fetching fails, so no collective is left outstanding.
             for work in works:
                 work.wait()
 
     def batches(self, batches, *, global_step, max_steps, save_steps):
+        # Pinned batches are copied host-to-device asynchronously on the training
+        # stream; the encode that consumes them is ordered after the copy.
+        if getattr(batches, "_non_blocking", None) is False:
+            batches._non_blocking = True
         iterator = iter(batches)
         try:
             for index in range(len(batches)):
                 if self.pending is None:
                     batch = next(iterator)
                 else:
-                    batch, ready, raw = self.pending
-                    producer = torch.cuda.current_stream(self.device)
-                    producer.wait_event(ready)
-                    _record_stream(batch.values, producer)
-                    self.pending = None
-                    del raw
+                    batch, self.pending = self.pending, None
                 step = global_step + index + 1
                 eligible = (index + 1 < len(batches) and (not max_steps or step < max_steps)
                             and (not save_steps or step % save_steps != 0))
