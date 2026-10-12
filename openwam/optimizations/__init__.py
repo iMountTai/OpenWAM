@@ -27,6 +27,7 @@ SWITCHES = (
     "OPENWAM_OPT_SAC_GEMM",
     "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
     "OPENWAM_OPT_ONLINE_ENCODE",
+    "OPENWAM_OPT_HW_QUEUES",
 )
 
 
@@ -35,6 +36,10 @@ def enabled(name: str, default: bool = False) -> bool:
         from openwam.optimizations.runtime import checkpoint_skip_layers
 
         return checkpoint_skip_layers() > 0
+    if name == "OPENWAM_OPT_HW_QUEUES":
+        from openwam.optimizations.hw_queues import requested
+
+        return requested() > 0
     value = os.environ.get(name, "").strip().lower()
     if not value:
         return default
@@ -47,6 +52,9 @@ def enabled(name: str, default: bool = False) -> bool:
 
 def configure_backends() -> None:
     """Called by scripts/train.py before model construction and device setup."""
+    from openwam.optimizations.hw_queues import configure as configure_hw_queues
+
+    configure_hw_queues()  # Before anything can initialize the HIP runtime.
     flags = {name: enabled(name) for name in SWITCHES}
     from openwam.optimizations.runtime import checkpoint_skip_layers
     from openwam.optimizations.sac import validate
@@ -73,6 +81,8 @@ def configure_backends() -> None:
     if os.environ.get("RANK", "0") == "0":
         settings = {name: int(value) for name, value in flags.items()}
         settings["OPENWAM_OPT_PARTIAL_CHECKPOINT"] = checkpoint_skip_layers()
+        if flags["OPENWAM_OPT_HW_QUEUES"]:
+            settings["OPENWAM_OPT_HW_QUEUES"] = int(os.environ["GPU_MAX_HW_QUEUES"])
         logger.info("[optimizations] switches=%s", settings)
 
 
