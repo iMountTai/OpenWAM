@@ -11,6 +11,23 @@ from openwam.optimizations import enabled
 logger = logging.getLogger(__name__)
 
 
+def collate_cpu_padding(samples):
+    """Keep tiny proprio masks as NumPy metadata through Accelerate's transfer.
+
+    _collect_inputs converts these back to CPU bool tensors. All other sample
+    fields retain the original list collator's behavior, including pinning and
+    nonblocking transfer of large tensors. This top-level collator is picklable.
+    """
+    result = []
+    for sample in samples:
+        mask = sample.get("proprio_mask")
+        if isinstance(mask, torch.Tensor) and mask.device.type == "cpu":
+            sample = dict(sample)
+            sample["proprio_mask"] = mask.detach().to(dtype=torch.bool).numpy().copy()
+        result.append(sample)
+    return result
+
+
 def frozen_eval(encoder):
     return not any(m.training for m in encoder.modules()) and not any(p.requires_grad for p in encoder.parameters())
 
@@ -136,6 +153,7 @@ def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
     if capacity <= 0:
         raise ValueError("OPENWAM_TEXT_CACHE_SIZE must be positive")
     signature = (id(tokenizer), str(device), enabled("OPENWAM_OPT_T5_PREFIX"),
+                 enabled("OPENWAM_OPT_PADDING_PLAN_CPU"),
                  tuple((p.data_ptr(), p._version, p.dtype, p.device) for p in params))
     if signature != getattr(text_encoder, "_openwam_text_cache_signature", None):
         text_encoder._openwam_text_cache_signature = signature

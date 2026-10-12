@@ -533,8 +533,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         pipeline_inputs = trim_text_context(pipeline_inputs)
         sample_mask = pipeline_inputs.pop("_proprio_sample_mask", None)
+        from openwam.optimizations.attention import cpu_context_mask
+
+        packed_mask = cpu_context_mask(
+            pipeline_inputs, append_proprio=bool(getattr(self, "_use_proprioception_context", False)),
+            sample_mask=sample_mask,
+        )
 
         if not bool(getattr(self, "_use_proprioception_context", False)):
+            if packed_mask is not None:
+                pipeline_inputs["context_mask"] = packed_mask
             return pipeline_inputs
         if self.proprio_encoder is None:
             raise RuntimeError("proprio context is enabled but proprio_encoder is not initialized.")
@@ -595,7 +603,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio_token = proprio_token * sample_mask_f
 
         context_mask = pipeline_inputs.get("context_mask")
-        if context_mask is None:
+        if packed_mask is not None:
+            context_mask = packed_mask[:, :-1]
+        elif context_mask is None:
             seq_lens = pipeline_inputs.get("seq_lens")
             if seq_lens is not None:
                 seq_lens = seq_lens.to(device=context.device)
@@ -608,7 +618,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         updated = dict(pipeline_inputs)
         updated["context"] = torch.cat([context, proprio_token], dim=1)
-        updated["context_mask"] = torch.cat([context_mask, sample_mask], dim=1)
+        updated["context_mask"] = (packed_mask if packed_mask is not None
+                                   else torch.cat([context_mask, sample_mask], dim=1))
         # The appended proprio token can sit after padded text tokens, so the
         # resulting valid tokens are not necessarily a contiguous prefix.
         # Keep the original text seq_lens and make context_mask authoritative.

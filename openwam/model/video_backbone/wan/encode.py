@@ -15,6 +15,7 @@ from torch import Tensor
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
 from openwam.optimizations.text import cached_text, t5_prefix_plan
+from openwam.optimizations import enabled
 
 
 def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
@@ -37,6 +38,10 @@ def _encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Ten
         truncation=True,
     )
     full_length = ids.shape[1]
+    # Keep native tokenizer lengths on the host for trim/packing. Consumers
+    # needing device lengths already move them explicitly. No GPU readback.
+    cpu_plan = enabled("OPENWAM_OPT_PADDING_PLAN_CPU") and mask.device.type == "cpu"
+    host_lengths = mask.gt(0).sum(dim=1).long() if cpu_plan else None
     prefix = t5_prefix_plan(ids, mask, text_encoder)
     if prefix is not None:
         stop, cpu_lengths = prefix
@@ -44,9 +49,9 @@ def _encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Ten
         mask = mask[:, :stop].contiguous()
     ids = ids.to(device)
     mask = mask.to(device)
-    seq_lens = mask.gt(0).sum(dim=1).long()
+    seq_lens = host_lengths if cpu_plan else mask.gt(0).sum(dim=1).long()
     context = text_encoder(ids, mask)
-    lengths_to_zero = seq_lens if prefix is None else cpu_lengths
+    lengths_to_zero = host_lengths.tolist() if cpu_plan else (seq_lens if prefix is None else cpu_lengths)
     for i, v in enumerate(lengths_to_zero):
         context[i, v:] = 0
     if prefix is not None:

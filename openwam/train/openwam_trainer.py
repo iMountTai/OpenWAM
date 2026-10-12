@@ -184,8 +184,8 @@ class OpenWAMTrainer:
           - enable_profiling=true (or 1): profiles rank 0 (wait=15, warmup=0, active=1, repeat=1).
           - enable_profiling=all:        profiles all ranks.
 
-        Defaults aligned with DiffSynth-Studio:
-          with_stack=False, record_shapes=False, profile_memory=False, with_modules=False.
+        OPENWAM_PROFILE_LIGHT=1 disables stacks/shapes and warms up for one
+        step (wait=14) while retaining the same active ProfilerStep#15.
         Saves compressed trace directly to:
           <output_path>/profiler_traces/rank{rank}_trace.json.gz
         """
@@ -252,19 +252,22 @@ class OpenWAMTrainer:
             if self._rank == 0:
                 print(f"\n{msg}\n", flush=True)
 
+        from openwam.optimizations import enabled
+
+        light = enabled("OPENWAM_PROFILE_LIGHT")
+        wait, warmup = (14, 1) if light else (15, 0)
         logger.info(
-            "[PROFILER] Profiler enabled on rank %d (wait=15, warmup=0, active=1, with_stack=True, record_shapes=True, traces=`%s`)",
-            self._rank,
-            trace_dir,
+            "[PROFILER] rank=%d wait=%d warmup=%d active=1 with_stack=%s record_shapes=%s traces=`%s`",
+            self._rank, wait, warmup, not light, not light, trace_dir,
         )
 
         return torch.profiler.profile(
             activities=activities,
-            schedule=torch.profiler.schedule(wait=15, warmup=0, active=1, repeat=1),
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=1, repeat=1),
             on_trace_ready=trace_handler,
-            record_shapes=True,
+            record_shapes=not light,
             profile_memory=False,
-            with_stack=True,
+            with_stack=not light,
             with_modules=False,
         )
 
@@ -408,7 +411,14 @@ class OpenWAMTrainer:
                 self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
                 num_workers=dataloader.num_workers, gradient_accumulation_steps=grad_accum,
             )
-        with prof_context as prof, online if online is not None else contextlib.nullcontext():
+        gc_trace = None
+        if enabled("OPENWAM_TRACE_GC"):
+            from openwam.optimizations.gc_trace import GCTrace
+
+            gc_trace = GCTrace(output_path, self._rank)
+        with (prof_context as prof,
+              online if online is not None else contextlib.nullcontext(),
+              gc_trace if gc_trace is not None else contextlib.nullcontext()):
             epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
             for epoch in epochs:
                 if hasattr(dataloader, "set_epoch"):
@@ -449,6 +459,8 @@ class OpenWAMTrainer:
                             opt_step += 1
 
                     global_step += 1
+                    if gc_trace is not None:
+                        gc_trace.step(global_step)
                     if prof is not None:
                         prof.step()
 
@@ -527,6 +539,12 @@ class OpenWAMTrainer:
             collate_fn=list,
             pin_memory=True,
         )
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_PADDING_PLAN_CPU"):
+            from openwam.optimizations.text import collate_cpu_padding
+
+            kwargs["collate_fn"] = collate_cpu_padding
         if not shuffle:
             logger.info(
                 "DataLoader shuffle disabled for MixtureDataset; its shuffled index map "
