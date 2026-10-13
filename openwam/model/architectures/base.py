@@ -690,7 +690,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         # Safetensors requires dense contiguous tensors. Channels-last VAE
         # parameters retain their logical shape and values in the checkpoint.
-        state_dict = {name: tensor.contiguous() for name, tensor in state_dict.items()}
+        from openwam.optimizations import enabled
+
+        if enabled("vae_channels_last"):
+            state_dict = {name: tensor.contiguous() for name, tensor in state_dict.items()}
         save_file(state_dict, path)
 
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
@@ -1106,7 +1109,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
         from openwam.optimizations import enabled, stage_training_indices
 
-        if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+        if enabled("constant_cache"):
             # Keep the CPU RNG sampling sequence unchanged, then move indices
             # before the forward/backward region instead of at loss weighting.
             video_timestep_ids = stage_training_indices(video_timestep_ids, _device)
@@ -1116,7 +1119,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
         # Keep seeded noise tied to logical coordinates, independent of VAE layout.
-        video_noise = torch.randn_like(inputs["input_latents"], memory_format=torch.contiguous_format)
+        video_noise = (torch.randn_like(inputs["input_latents"], memory_format=torch.contiguous_format)
+                       if enabled("vae_channels_last") else torch.randn_like(inputs["input_latents"]))
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
         inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
         video_target = video_noise - inputs["input_latents"]
@@ -1135,7 +1139,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
         if lambda_action > 0 and actions is not None:
             action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
-            if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+            if enabled("constant_cache"):
                 action_timestep_ids = stage_training_indices(action_timestep_ids, _device)
 
             action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)

@@ -1,0 +1,48 @@
+# All options are independent and off by default on every platform.
+vae_channels_last: false
+constant_cache: false
+text_cache: false
+text_cache_size: 32
+fa2_padding: false
+fa2_mask_fused: false
+padding_plan_cpu: false
+mot_split_attn: false
+rope_real: false
+zero_overlap: false
+checkpoint_skip_layers: 0
+uint8_preprocess: false
+t5_prefix: false
+text_trim: false
+zero_reduce_scatter: false
+online_encode: false
+
+compile:
+  mot: false
+  vae: false
+  pointwise: false
+  vae_pointwise: false
+  threads: null
+
+sac:
+  attention: false
+  ffn_full: false
+  gemm: false
+  layers: null  # All checkpointed layers when a SAC policy is enabled.
+  extra_ops: []
+
+dtk:
+  enabled: false  # USE_DTK equivalent; also requires DTK build metadata.
+  hw_queues: null
+  lightop_norm: false  # Optional DAS Lightop; never imported on AMD/NVIDIA.
+  linear_bias2d: false  # gfx936 projection path, guarded by tensor/backend capabilities.
+  blas_prefer_hipblaslt: false
+  allow_tf32: false
+  fine_grain_pcie: false
+
+profiling:
+  ranks: 'off'  # off / rank0 / all
+  light: false
+
+diagnostics:
+  checkpoint_stats: false
+  trace_gc: false

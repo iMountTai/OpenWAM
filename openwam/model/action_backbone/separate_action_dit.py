@@ -60,7 +60,7 @@ _MOT_VARIANTS = ("joint_self_attn", "idm")
 
 
 def _modulate(x, shift, scale):
-    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+    if enabled("compile.pointwise") or extras_enabled():
         return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
@@ -318,7 +318,7 @@ class SelfAttnActionDiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
 
     def gate(self, x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+        if enabled("compile.pointwise") or extras_enabled():
             return pointwise.gate(x, gate, residual)
         return x + gate * residual
 

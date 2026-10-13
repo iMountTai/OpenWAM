@@ -1,22 +1,18 @@
 """Compile training blocks, with explicit boundaries for optional eager kernels."""
 
 import logging
-import os
 
 import torch
 
 from openwam.optimizations import enabled
+from openwam.optimizations.config import settings
 
 logger = logging.getLogger(__name__)
 
 
 def compile_scope():
-    if not enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
-        return set()
-    scope = os.environ.get("OPENWAM_GLOBAL_COMPILE_SCOPE", "all").strip().lower()
-    if scope not in ("all", "mot", "vae"):
-        raise ValueError("OPENWAM_GLOBAL_COMPILE_SCOPE must be all, mot or vae")
-    return {"mot", "vae"} if scope == "all" else {scope}
+    config = settings().compile
+    return {name for name in ("mot", "vae") if getattr(config, name)}
 
 
 def _options():
@@ -28,7 +24,7 @@ def _options():
 
 def mark_mot_text_dynamic(vstate, astate):
     """Annotate prepared text inputs before entering the compiled MoT layer."""
-    if not enabled("OPENWAM_OPT_TEXT_TRIM"):
+    if not enabled("text_trim"):
         return
     from torch._dynamo import mark_dynamic
 
@@ -51,14 +47,14 @@ def mark_mot_text_dynamic(vstate, astate):
 
 
 def compile_mot_layer(driver):
-    from openwam.optimizations.sac import attention_boundary, active
+    from openwam.optimizations.sac import active, attention_boundary
 
     fragmented = any(enabled(name) for name in (
-        "OPENWAM_OPT_MOT_SPLIT_ATTN", "OPENWAM_OPT_FA2_PADDING",
+        "mot_split_attn", "fa2_padding",
     )) or active()
     driver._compiled_attention = (
         torch.compiler.disable(driver._mixed_attention)
-        if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN") or attention_boundary() else driver._mixed_attention
+        if enabled("mot_split_attn") or attention_boundary() else driver._mixed_attention
     )
 
     def layer(video_block, action_block, vstate, astate, attn_mask):
@@ -71,7 +67,7 @@ def compile_mot_layer(driver):
 
     logger.info(
         "[optimizations] MoT block compile enabled; fullgraph=%s, dynamic text length=%s",
-        not fragmented, enabled("OPENWAM_OPT_TEXT_TRIM"),
+        not fragmented, enabled("text_trim"),
     )
     return torch.compile(layer, dynamic=False, fullgraph=not fragmented, options=_options())
 

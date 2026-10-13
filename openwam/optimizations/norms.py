@@ -10,7 +10,14 @@ from openwam.optimizations import enabled
 
 @lru_cache(maxsize=1)
 def lightop_ops():
-    from lightop import op
+    from openwam.optimizations.dtk import enabled as dtk_enabled
+
+    if not dtk_enabled():
+        raise RuntimeError("DAS Lightop requires optimizations.dtk.enabled=true on a DTK build")
+    try:
+        from lightop import op
+    except ImportError as exc:
+        raise RuntimeError("optimizations.dtk.lightop_norm requires the optional DAS lightop package") from exc
 
     for name in ("rmsnorm_forward_autograd", "layernorm_forward_autograd"):
         if not hasattr(op, name):
@@ -19,9 +26,11 @@ def lightop_ops():
 
 
 def _supported(x, *parameters):
+    from openwam.optimizations.dtk import enabled as dtk_enabled
+
     return (
         x.is_cuda
-        and bool(getattr(torch.version, "hip", None))
+        and dtk_enabled()
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.shape[-1] >= 64
         and all(p is None or (p.dtype == x.dtype and p.is_contiguous()) for p in parameters)
@@ -29,7 +38,7 @@ def _supported(x, *parameters):
 
 
 def lightop_rms_norm(x, weight, eps):
-    if enabled("OPENWAM_OPT_GLOBAL_COMPILE") and torch.compiler.is_compiling():
+    if enabled("compile") and torch.compiler.is_compiling():
         return None
     from openwam.optimizations.sac import extras_enabled, native_mot_expression
 
@@ -49,9 +58,9 @@ class LayerNorm(nn.LayerNorm):
         if extras_enabled() and not torch.compiler.is_compiling():
             native_sac = native_mot_expression()
         if (
-            enabled("OPENWAM_OPT_LIGHTOP_NORM")
+            enabled("dtk.lightop_norm")
             and not native_sac
-            and not (enabled("OPENWAM_OPT_GLOBAL_COMPILE") and torch.compiler.is_compiling())
+            and not (enabled("compile") and torch.compiler.is_compiling())
             and tuple(self.normalized_shape) == (x.shape[-1],)
             and _supported(x, self.weight, self.bias)
         ):

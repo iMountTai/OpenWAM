@@ -4,8 +4,8 @@ Each checkpoint owns its standard forward/recompute modes. Only explicit eager
 operator regions enter those modes; unselected compiled regions keep their path.
 No activation cache, backward implementation or parameter replacement lives here.
 
-Policies apply to the trailing OPENWAM_SAC_LAYERS of the checkpointed layers.
-Layers without checkpointing (OPENWAM_OPT_PARTIAL_CHECKPOINT) keep their
+Policies apply to the trailing optimizations.sac.layers of the checkpointed layers.
+Layers without checkpointing (checkpoint_skip_layers) keep their
 activations through autograd, so SAC never caches them a second time.
 """
 
@@ -23,10 +23,10 @@ from torch.utils import checkpoint as torch_checkpoint
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from openwam.optimizations import enabled
+from openwam.optimizations.config import settings
 from openwam.optimizations.runtime import checkpoint_layers, checkpoint_skip_layers, integer
 
-
-FLAGS = ("OPENWAM_OPT_SAC_FA", "OPENWAM_OPT_SAC_FFN_FULL", "OPENWAM_OPT_SAC_GEMM")
+FLAGS = ("sac.attention", "sac.ffn_full", "sac.gemm")
 logger = logging.getLogger(__name__)
 _session = ContextVar("openwam_sac_session", default=None)
 _regions = ContextVar("openwam_sac_regions", default=())
@@ -42,6 +42,9 @@ def dispatcher(fn):
     dispatcher separately, guarded on the callable argument. Every attention
     callable or per-layer module then recompiles it until recompile_limit.
     """
+    config = settings().compile
+    if not (config.mot or config.vae or config.pointwise or config.vae_pointwise):
+        return fn
     try:
         from torch._dynamo.eval_frame import skip_code
     except ImportError:
@@ -64,7 +67,7 @@ _GEMM_OPS = frozenset(("aten.mm.default", "aten.addmm.default", "aten.bmm.defaul
 
 
 def extras_enabled():
-    return bool(os.environ.get("OPENWAM_SAC_EXTRA_OPS", "").strip())
+    return bool(settings().sac.extra_ops)
 
 
 def active():
@@ -72,21 +75,21 @@ def active():
 
 
 def ffn_boundary():
-    return enabled("OPENWAM_OPT_SAC_FFN_FULL") or enabled("OPENWAM_OPT_SAC_GEMM") or extras_enabled()
+    return enabled("sac.ffn_full") or enabled("sac.gemm") or extras_enabled()
 
 
 def attention_boundary():
-    return enabled("OPENWAM_OPT_SAC_FA") or enabled("OPENWAM_OPT_SAC_GEMM") or extras_enabled()
+    return enabled("sac.attention") or enabled("sac.gemm") or extras_enabled()
 
 
 def projection_boundary():
-    return enabled("OPENWAM_OPT_SAC_GEMM") or extras_enabled()
+    return enabled("sac.gemm") or extras_enabled()
 
 
 @lru_cache(maxsize=16)
 def _extra_ops(raw):
     result = set()
-    for identifier in raw.split(","):
+    for identifier in raw:
         identifier = identifier.strip()
         if not identifier:
             continue
@@ -100,23 +103,27 @@ def _extra_ops(raw):
         if op in getattr(torch_checkpoint, "SAC_IGNORED_OPS", ()) or op._schema.is_mutable:
             raise ValueError(f"SAC cannot cache a metadata or mutating op: {identifier}")
         if identifier in _ATTENTION_OPS:
-            raise ValueError("Use OPENWAM_OPT_SAC_FA for attention operators, rather than SAC_EXTRA_OPS")
+            raise ValueError("Use optimizations.sac.attention for attention operators, rather than sac.extra_ops")
         result.add(identifier)
-    if raw.strip() and not result:
-        raise ValueError("OPENWAM_SAC_EXTRA_OPS contains no operator identifiers")
+    if raw and not result:
+        raise ValueError("optimizations.sac.extra_ops contains no operator identifiers")
     return frozenset(result)
+
+
+def extra_ops():
+    return _extra_ops(tuple(settings().sac.extra_ops))
 
 
 def layers(total):
     """SAC layer count; unset covers every checkpointed layer."""
     checkpointed = checkpoint_layers(total)
-    if not os.environ.get("OPENWAM_SAC_LAYERS", "").strip():
+    if settings().sac.layers is None:
         return checkpointed
-    count = integer("OPENWAM_SAC_LAYERS", checkpointed)
+    count = integer("sac.layers", checkpointed)
     if count > checkpointed:
         raise ValueError(
-            f"OPENWAM_SAC_LAYERS={count} exceeds checkpointed layers={checkpointed} "
-            f"(model layers={total}, OPENWAM_OPT_PARTIAL_CHECKPOINT={total - checkpointed})"
+            f"optimizations.sac.layers={count} exceeds checkpointed layers={checkpointed} "
+            f"(model layers={total}, checkpoint_skip_layers={total - checkpointed})"
         )
     return count
 
@@ -128,17 +135,14 @@ def layer_range(total):
 
 
 def validate(total=None):
-    enabled("OPENWAM_CHECKPOINT_STATS")
-    for name in ("OPENWAM_OPT_SAC_FFN", "OPENWAM_OPT_SAC_FFN_INPUT"):
-        if enabled(name):
-            raise ValueError(f"{name} was removed; use OPENWAM_OPT_SAC_FFN_FULL=1 with OPENWAM_SAC_LAYERS=N")
+    enabled("diagnostics.checkpoint_stats")
     if not active():
         return
     if total is not None:
         layers(total)
-        _extra_ops(os.environ.get("OPENWAM_SAC_EXTRA_OPS", ""))
-    elif os.environ.get("OPENWAM_SAC_LAYERS", "").strip():
-        integer("OPENWAM_SAC_LAYERS", 0)
+        extra_ops()
+    elif settings().sac.layers is not None:
+        integer("sac.layers", 0)
 
 
 def prepare(architecture):
@@ -157,7 +161,7 @@ def prepare(architecture):
         for module in modules:
             if getattr(module, "_compiled_call_impl", None) is not None or hasattr(module.forward, "_torchdynamo_orig_callable"):
                 raise ValueError("Complete SAC requires operator regions without separate module/forward compilation")
-    if enabled("OPENWAM_OPT_SAC_FA"):
+    if enabled("sac.attention"):
         from openwam.model.video_backbone.wan.models.dit import fused_backend_name
 
         backend_name = fused_backend_name()
@@ -176,17 +180,17 @@ def prepare(architecture):
     logger.info(
         "[optimizations] standard SAC flags=%s, layers=[%d, %d) of %d, no-checkpoint tail=%d, extra ops=%s",
         {name: enabled(name) for name in FLAGS}, start, stop, backbone.num_layers, backbone.num_layers - stop,
-        sorted(_extra_ops(os.environ.get("OPENWAM_SAC_EXTRA_OPS", ""))),
+        sorted(extra_ops()),
     )
 
 
 class _Policy:
     def __init__(self):
-        self.fa = enabled("OPENWAM_OPT_SAC_FA")
-        self.ffn = enabled("OPENWAM_OPT_SAC_FFN_FULL")
-        self.gemm = enabled("OPENWAM_OPT_SAC_GEMM")
-        self.extra = _extra_ops(os.environ.get("OPENWAM_SAC_EXTRA_OPS", ""))
-        self.diagnostics = enabled("OPENWAM_CHECKPOINT_STATS")
+        self.fa = enabled("sac.attention")
+        self.ffn = enabled("sac.ffn_full")
+        self.gemm = enabled("sac.gemm")
+        self.extra = extra_ops()
+        self.diagnostics = enabled("diagnostics.checkpoint_stats")
         self.seen_extra = set()
         self.seen_fa = False
 
@@ -216,7 +220,7 @@ class _Policy:
 @contextmanager
 def _checkpoint_scope(mode, phase, policy):
     token = _session.set(mode)
-    if enabled("OPENWAM_CHECKPOINT_STATS"):
+    if enabled("diagnostics.checkpoint_stats"):
         _counts[(phase, "checkpoint", "entered", "layer")] += 1
         if mode is not None:
             _counts[(phase, "checkpoint", "selected", "layer")] += 1
@@ -256,8 +260,7 @@ def native_mot_expression():
 def _invoke(region, fn, *args, **kwargs):
     mode = _session.get()
     # Norms moved out of GLOBAL keep the same native expression/backend choice.
-    scope = os.environ.get("OPENWAM_GLOBAL_COMPILE_SCOPE", "all").strip().lower()
-    native = enabled("OPENWAM_OPT_GLOBAL_COMPILE") and scope in {"mot", "all"}
+    native = enabled("compile.mot")
     native_token = _native_mot.set(native)
     previous = _regions.get()
     region_stack = previous if region == "attention" and previous and previous[-1].endswith("attention") else (*previous, region)
@@ -351,7 +354,7 @@ def report_step(step, device, metrics, steps_per_sec, batch_size, opt_step):
     print("[checkpoint_stats] " + json.dumps({
         "rank": int(os.environ.get("RANK", "0")), "step": step, "optimizer_step": opt_step,
         "sac_flags": {name: enabled(name) for name in FLAGS},
-        "sac_layers": os.environ.get("OPENWAM_SAC_LAYERS", "all"),
+        "sac_layers": settings().sac.layers if settings().sac.layers is not None else "all",
         "skip_layers": checkpoint_skip_layers(), "operators": groups,
         "s_microstep": 1.0 / steps_per_sec,
         "global_samples_s": steps_per_sec * batch_size * int(os.environ.get("WORLD_SIZE", "1")),

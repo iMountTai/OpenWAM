@@ -10,18 +10,14 @@ The queue count does not change stream priorities.
 import logging
 import os
 
-from openwam.optimizations.runtime import integer
+from openwam.optimizations.config import settings
+from openwam.optimizations.dtk import enabled
 
 logger = logging.getLogger(__name__)
 
-SWITCH = "OPENWAM_OPT_HW_QUEUES"
-
-
 def requested():
     """Queue count from the switch; unset/false means leave HIP's default."""
-    if os.environ.get(SWITCH, "").strip().lower() in {"", "0", "false", "no", "off"}:
-        return 0
-    return integer(SWITCH, 0, minimum=2)
+    return (settings().dtk.hw_queues or 0) if enabled() else 0
 
 
 def configure():
@@ -29,6 +25,9 @@ def configure():
     count = requested()
     if not count:
         return
-    current = os.environ.setdefault("GPU_MAX_HW_QUEUES", str(count))
-    if current != str(count):
-        logger.warning("[optimizations] %s=%d ignored: GPU_MAX_HW_QUEUES=%s already set", SWITCH, count, current)
+    import torch
+
+    current = os.environ.get("GPU_MAX_HW_QUEUES")
+    if torch.cuda.is_initialized() and current != str(count):
+        raise RuntimeError("Set optimizations.dtk.hw_queues before the HIP runtime initializes")
+    os.environ["GPU_MAX_HW_QUEUES"] = str(count)

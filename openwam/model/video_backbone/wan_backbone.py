@@ -41,7 +41,6 @@ from openwam.model.video_backbone.wan.preprocess import (
     check_resize_height_width,
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
-from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 
 logger = logging.getLogger(__name__)
 
@@ -522,11 +521,10 @@ class WanBase(VideoBackbone):
         return q, k, v, post_state
 
     def pre_attn_at_layer_for_compile(
-        self, layer_id: int, state: BlockLoopState, *, block=None
+        self, layer_id: int, state: BlockLoopState
     ) -> Tuple[Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         """Compile-friendly Wan pre-attention half using a tensor tuple post-state."""
-        if block is None:
-            block = state.extras["dit"].blocks[layer_id]
+        block = state.extras["dit"].blocks[layer_id]
 
         time_modulation = state.time_mod
         has_seq = time_modulation.dim() == 4
@@ -539,14 +537,12 @@ class WanBase(VideoBackbone):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
         residual_x = state.hidden_states
-        from openwam.optimizations.sac import run_norm
-
-        attn_input = modulate(run_norm(block.norm1, state.hidden_states), shift_msa, scale_msa)
+        attn_input = modulate(block.norm1(state.hidden_states), shift_msa, scale_msa)
 
         self_attn = block.self_attn
-        q = run_norm(self_attn.norm_q, video_linear(self_attn.q, attn_input))
-        k = run_norm(self_attn.norm_k, video_linear(self_attn.k, attn_input))
-        v = video_linear(self_attn.v, attn_input)
+        q = self_attn.norm_q(self_attn.q(attn_input))
+        k = self_attn.norm_k(self_attn.k(attn_input))
+        v = self_attn.v(attn_input)
         q = rope_apply(q, state.rope_freqs, self_attn.num_heads)
         k = rope_apply(k, state.rope_freqs, self_attn.num_heads)
 
@@ -571,30 +567,22 @@ class WanBase(VideoBackbone):
         return self.post_attn_at_layer_for_compile(layer_id, state, attn_out, post_state)
 
     def post_attn_at_layer_for_compile(
-        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: tuple[Tensor, ...], *, block=None
+        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: tuple[Tensor, ...]
     ) -> BlockLoopState:
         """Compile-friendly Wan post-attention half consuming a tensor tuple."""
-        if block is None:
-            block = state.extras["dit"].blocks[layer_id]
+        block = state.extras["dit"].blocks[layer_id]
         self_attn = block.self_attn
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
-        hidden_states = block.gate(residual_x, gate_msa, video_linear(self_attn.o, attn_out))
+        hidden_states = block.gate(residual_x, gate_msa, self_attn.o(attn_out))
         context_mask = None
         if state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
-        from openwam.optimizations.sac import ffn_boundary, run_ffn as run_complete_ffn, run_norm
-
         hidden_states = hidden_states + block.cross_attn(
-            run_norm(block.norm3, hidden_states), state.context, ctx_mask=context_mask,
-            **cross_attention_kwargs(block.cross_attn),
+            block.norm3(hidden_states), state.context, ctx_mask=context_mask
         )
-        mlp_input = modulate(run_norm(block.norm2, hidden_states), shift_mlp, scale_mlp)
-        if ffn_boundary():
-            mlp_output = run_complete_ffn(block.ffn, mlp_input, video=True)
-        else:
-            mlp_output = video_ffn(block.ffn, mlp_input)
-        hidden_states = block.gate(hidden_states, gate_mlp, mlp_output)
+        mlp_input = modulate(block.norm2(hidden_states), shift_mlp, scale_mlp)
+        hidden_states = block.gate(hidden_states, gate_mlp, block.ffn(mlp_input))
         state.hidden_states = hidden_states
 
         wan_dit_forward.apply_post_block_residuals(layer_id, state)

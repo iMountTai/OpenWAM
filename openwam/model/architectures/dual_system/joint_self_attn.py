@@ -119,7 +119,9 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
                 "set. Architecture must be built from a non-None cfg."
             )
 
-        self._mot_driver = DualSystemMoTDriver(
+        from openwam.optimizations import mot_driver_type
+
+        self._mot_driver = mot_driver_type()(
             self.video_backbone,
             self.action_backbone,
             **self._mot_driver_kwargs,

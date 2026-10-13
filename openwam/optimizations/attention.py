@@ -87,7 +87,7 @@ def cpu_context_mask(inputs, *, append_proprio=False, sample_mask=None):
     mask to the host. The cache uses the final device tensor's identity/version;
     arbitrary masks and subsequent mutations keep the original packing path.
     """
-    if not (enabled("OPENWAM_OPT_PADDING_PLAN_CPU") and enabled("OPENWAM_OPT_FA2_PADDING")):
+    if not (enabled("padding_plan_cpu") and enabled("fa2_padding")):
         return None
     context = inputs.get("context")
     if not isinstance(context, torch.Tensor) or context.ndim != 3:
@@ -139,15 +139,15 @@ def _compiled_nonempty():
 
 
 def _mask_nonempty(out, nonempty):
-    if enabled("OPENWAM_OPT_FA2_MASK_FUSED"):
+    if enabled("fa2_mask_fused"):
         return _compiled_nonempty()(out, nonempty)
     return out.masked_fill((~nonempty).view(-1, 1, 1), 0)
 
 
 def fa2_padding(q, k, v, mask, num_heads):
     if (
-        enabled("OPENWAM_OPT_FA2_PADDING")
-        and enabled("OPENWAM_OPT_GLOBAL_COMPILE")
+        enabled("fa2_padding")
+        and enabled("compile")
         and torch.compiler.is_compiling()
     ):
         return _eager_fa2_padding(q, k, v, mask, num_heads)
@@ -156,7 +156,7 @@ def fa2_padding(q, k, v, mask, num_heads):
 
 def _fa2_padding(q, k, v, mask, num_heads):
     """Return (B,Sq,H*D) or None when the mask/backend cannot use this fast path."""
-    if not enabled("OPENWAM_OPT_FA2_PADDING") or mask is None:
+    if not enabled("fa2_padding") or mask is None:
         return None
     if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
         return None
@@ -213,7 +213,7 @@ def split_mask_plan(mask):
 
 def split_attention(q, k, v, mask, num_heads, attention_fn):
     plan = getattr(mask, "_openwam_split_plan", None)
-    if not enabled("OPENWAM_OPT_MOT_SPLIT_ATTN") or plan is None:
+    if not enabled("mot_split_attn") or plan is None:
         return None
     if q.shape[1] != mask.shape[-2] or k.shape[1] != mask.shape[-1]:
         return None

@@ -1,12 +1,12 @@
 """Bounded prompt caching restricted to frozen, deterministic text encoders."""
 
 import logging
-import os
 from collections import OrderedDict
 
 import torch
 
 from openwam.optimizations import enabled
+from openwam.optimizations.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _native_t5(encoder):
 
 def t5_prefix_plan(ids, mask, text_encoder):
     """Return a CPU right-padding plan for the native frozen T5, or None."""
-    if not enabled("OPENWAM_OPT_T5_PREFIX") or not frozen_eval(text_encoder):
+    if not enabled("t5_prefix") or not frozen_eval(text_encoder):
         return None
     if (not _native_t5(text_encoder) or ids.device.type != "cpu" or mask.device.type != "cpu"
             or ids.ndim != 2 or mask.shape != ids.shape or not ids.shape[0] or not ids.shape[1]):
@@ -98,7 +98,7 @@ def t5_prefix_plan(ids, mask, text_encoder):
 
 def trim_text_context(inputs):
     """Crop only the batch's common masked tail, before any proprio append."""
-    if not enabled("OPENWAM_OPT_TEXT_TRIM"):
+    if not enabled("text_trim"):
         return inputs
     context = inputs.get("context")
     if not isinstance(context, torch.Tensor) or context.ndim != 3 or context.shape[1] <= 1:
@@ -141,7 +141,7 @@ def trim_text_context(inputs):
 
 
 def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
-    if not enabled("OPENWAM_OPT_TEXT_CACHE"):
+    if not enabled("text_cache"):
         return encode(prompts)
     params = tuple(text_encoder.parameters())
     if not frozen_eval(text_encoder):
@@ -149,11 +149,9 @@ def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
             logger.warning("[optimizations] text cache skipped: encoder must be frozen and in eval mode")
             text_encoder._openwam_cache_skip_warned = True
         return encode(prompts)
-    capacity = int(os.environ.get("OPENWAM_TEXT_CACHE_SIZE", "32"))
-    if capacity <= 0:
-        raise ValueError("OPENWAM_TEXT_CACHE_SIZE must be positive")
-    signature = (id(tokenizer), str(device), enabled("OPENWAM_OPT_T5_PREFIX"),
-                 enabled("OPENWAM_OPT_PADDING_PLAN_CPU"),
+    capacity = settings().text_cache_size
+    signature = (id(tokenizer), str(device), enabled("t5_prefix"),
+                 enabled("padding_plan_cpu"),
                  tuple((p.data_ptr(), p._version, p.dtype, p.device) for p in params))
     if signature != getattr(text_encoder, "_openwam_text_cache_signature", None):
         text_encoder._openwam_text_cache_signature = signature

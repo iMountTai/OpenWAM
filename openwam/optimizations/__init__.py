@@ -3,100 +3,92 @@
 import logging
 import os
 
+from openwam.optimizations.config import configure, option, settings
+
 logger = logging.getLogger(__name__)
 
 SWITCHES = (
-    "OPENWAM_OPT_VAE_CHANNELS_LAST",
-    "OPENWAM_OPT_CONSTANT_CACHE",
-    "OPENWAM_OPT_TEXT_CACHE",
-    "OPENWAM_OPT_FA2_PADDING",
-    "OPENWAM_OPT_FA2_MASK_FUSED",
-    "OPENWAM_OPT_PADDING_PLAN_CPU",
-    "OPENWAM_OPT_MOT_SPLIT_ATTN",
-    "OPENWAM_OPT_POINTWISE_COMPILE",
-    "OPENWAM_OPT_ROPE_REAL",
-    "OPENWAM_OPT_ZERO_OVERLAP",
-    "OPENWAM_OPT_LIGHTOP_NORM",
-    "OPENWAM_OPT_VAE_POINTWISE_COMPILE",
-    "OPENWAM_OPT_GLOBAL_COMPILE",
-    "OPENWAM_OPT_PARTIAL_CHECKPOINT",
-    "OPENWAM_OPT_UINT8_PREPROCESS",
-    "OPENWAM_OPT_T5_PREFIX",
-    "OPENWAM_OPT_TEXT_TRIM",
-    "OPENWAM_OPT_LINEAR_BIAS2D",
-    "OPENWAM_OPT_SAC_FA",
-    "OPENWAM_OPT_SAC_FFN_FULL",
-    "OPENWAM_OPT_SAC_GEMM",
-    "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
-    "OPENWAM_OPT_ONLINE_ENCODE",
-    "OPENWAM_OPT_HW_QUEUES",
+    "vae_channels_last",
+    "constant_cache",
+    "text_cache",
+    "fa2_padding",
+    "fa2_mask_fused",
+    "padding_plan_cpu",
+    "mot_split_attn",
+    "compile.pointwise",
+    "rope_real",
+    "zero_overlap",
+    "dtk.lightop_norm",
+    "compile.vae_pointwise",
+    "compile",
+    "checkpoint_skip_layers",
+    "uint8_preprocess",
+    "t5_prefix",
+    "text_trim",
+    "dtk.linear_bias2d",
+    "sac.attention",
+    "sac.ffn_full",
+    "sac.gemm",
+    "zero_reduce_scatter",
+    "online_encode",
+    "dtk.hw_queues",
 )
 
 
-def enabled(name: str, default: bool = False) -> bool:
-    if name == "OPENWAM_OPT_PARTIAL_CHECKPOINT":
-        from openwam.optimizations.runtime import checkpoint_skip_layers
-
-        return checkpoint_skip_layers() > 0
-    if name == "OPENWAM_OPT_HW_QUEUES":
-        from openwam.optimizations.hw_queues import requested
-
-        return requested() > 0
-    value = os.environ.get(name, "").strip().lower()
-    if not value:
-        return default
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be 0/1, false/true, no/yes or off/on; got {value!r}")
+def enabled(name: str) -> bool:
+    if name == "checkpoint_skip_layers":
+        return settings().checkpoint_skip_layers > 0
+    if name == "dtk.hw_queues":
+        return settings().dtk.enabled and settings().dtk.hw_queues is not None
+    if name == "compile":
+        config = settings().compile
+        return any((config.mot, config.vae))
+    value = option(name)
+    if not isinstance(value, bool):
+        raise TypeError(f"optimizations.{name} is not a boolean option")
+    return value
 
 
-def configure_backends() -> None:
+def configure_backends(config=None) -> None:
     """Called by scripts/train.py before model construction and device setup."""
-    from openwam.optimizations.hw_queues import configure as configure_hw_queues
+    configure(config)
+    from openwam.optimizations.dtk import configure as configure_dtk
 
-    configure_hw_queues()  # Before anything can initialize the HIP runtime.
+    configure_dtk()  # Before anything can initialize the HIP runtime.
+    if settings().compile.threads is not None:
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(settings().compile.threads)
     flags = {name: enabled(name) for name in SWITCHES}
+    if not any(flags.values()) and not settings().sac.extra_ops:
+        return
     from openwam.optimizations.runtime import checkpoint_skip_layers
     from openwam.optimizations.sac import validate
 
     validate()
-    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
+    if flags["vae_channels_last"]:
         from openwam.optimizations.vae_layout import validate as validate_layout
 
         validate_layout()
-    if flags["OPENWAM_OPT_GLOBAL_COMPILE"]:
+    if flags["compile"]:
         from openwam.optimizations.global_compile import compile_scope
 
         compile_scope()
-    if flags["OPENWAM_OPT_LIGHTOP_NORM"]:
-        import torch
-
-        if getattr(torch.version, "hip", None):
-            from openwam.optimizations.norms import lightop_ops
-
-            lightop_ops()
-    if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
-        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
-        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
     if os.environ.get("RANK", "0") == "0":
-        settings = {name: int(value) for name, value in flags.items()}
-        settings["OPENWAM_OPT_PARTIAL_CHECKPOINT"] = checkpoint_skip_layers()
-        if flags["OPENWAM_OPT_HW_QUEUES"]:
-            settings["OPENWAM_OPT_HW_QUEUES"] = int(os.environ["GPU_MAX_HW_QUEUES"])
-        logger.info("[optimizations] switches=%s", settings)
+        effective = {name: int(value) for name, value in flags.items()}
+        effective["checkpoint_skip_layers"] = checkpoint_skip_layers()
+        if flags["dtk.hw_queues"]:
+            effective["dtk.hw_queues"] = option("dtk.hw_queues")
+        logger.info("[optimizations] settings=%s", effective)
 
 
 def configure_zero(config: dict) -> None:
-    if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER") or enabled("OPENWAM_OPT_ONLINE_ENCODE"):
+    if enabled("zero_reduce_scatter") or enabled("online_encode"):
         zero = config["zero_optimization"]
         if zero.get("stage") != 2:
             raise ValueError("ReduceScatter and online encoding currently require ZeRO-2")
-        if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
+        if enabled("zero_reduce_scatter"):
             zero.update(reduce_scatter=True, contiguous_gradients=True, use_multi_rank_bucket_allreduce=True,
                         overlap_comm=True)
-    if enabled("OPENWAM_OPT_ZERO_OVERLAP"):
+    if enabled("zero_overlap"):
         zero = config["zero_optimization"]
         zero.update(overlap_comm=True, contiguous_gradients=True)
         # Retain the measured ZeRO-2 default and explicit caller configurations.
@@ -114,16 +106,26 @@ def prepare_model(architecture) -> None:
     from openwam.optimizations.sac import prepare
 
     prepare(architecture)
-    if enabled("OPENWAM_OPT_PARTIAL_CHECKPOINT"):
+    if (enabled("compile.mot") or any(enabled(name) for name in ("sac.ffn_full", "sac.gemm"))
+            or settings().sac.extra_ops or enabled("dtk.linear_bias2d")):
+        from openwam.model.video_backbone.wan_backbone import WanBase
+
+        backbone = getattr(architecture, "video_backbone", None)
+        if isinstance(backbone, WanBase):
+            from openwam.optimizations.wan import prepare as prepare_wan
+
+            prepare_wan(backbone)
+    if enabled("checkpoint_skip_layers"):
         if type(architecture).__name__ != "DualSystemSelfAttnArchitecture":
-            raise ValueError("OPENWAM_OPT_PARTIAL_CHECKPOINT currently requires dual_system/joint_self_attn")
-    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST")
+            raise ValueError("checkpoint_skip_layers currently requires dual_system/joint_self_attn")
+    layout = enabled("vae_channels_last")
     compile_vae = False
-    if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+    if enabled("compile"):
         from openwam.optimizations.global_compile import compile_scope
 
         compile_vae = "vae" in compile_scope()
-    if not layout and not compile_vae:
+    adapt_vae = any(enabled(name) for name in ("vae_channels_last", "compile.vae_pointwise", "constant_cache"))
+    if not adapt_vae and not compile_vae:
         return
     import torch
 
@@ -132,6 +134,10 @@ def prepare_model(architecture) -> None:
     if vae is None:
         logger.warning("[optimizations] VAE preparation skipped: no native Wan VAE")
         return
+    if adapt_vae:
+        from openwam.optimizations.vae import prepare as prepare_vae
+
+        prepare_vae(vae)
     if layout:
         torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
         torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
@@ -144,7 +150,7 @@ def prepare_model(architecture) -> None:
 
 def prepare_runtime_constants(architecture) -> None:
     """Stage small, immutable training constants after Accelerate device placement."""
-    if not enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+    if not enabled("constant_cache"):
         return
     backbone = getattr(architecture, "video_backbone", None)
     if backbone is None:
@@ -160,6 +166,34 @@ def prepare_runtime_constants(architecture) -> None:
     if vae is not None and hasattr(vae, "prepare_scale_cache"):
         vae.prepare_scale_cache()
     logger.info("[optimizations] scheduler tables and VAE scales staged on %s", device)
+
+
+def create_trainer(cfg, *, accelerator=None, dataset=None):
+    """One training-entry hook; keep the upstream trainer for the all-off route."""
+    configure_backends(cfg.get("optimizations"))
+    config = settings()
+    active = (any(enabled(name) for name in SWITCHES) or bool(config.sac.extra_ops)
+              or config.profiling.ranks != "off" or config.diagnostics.checkpoint_stats or config.diagnostics.trace_gc)
+    if active:
+        from openwam.optimizations.trainer import OptimizationTrainer as trainer
+    else:
+        from openwam.train.openwam_trainer import OpenWAMTrainer as trainer
+    return trainer(cfg, accelerator=accelerator, dataset=dataset)
+
+
+def mot_driver_type():
+    """Select a configured extension without altering the upstream driver class."""
+    config = settings()
+    active = (config.compile.mot or config.mot_split_attn or config.checkpoint_skip_layers > 0
+              or any((config.sac.attention, config.sac.ffn_full, config.sac.gemm, bool(config.sac.extra_ops)))
+              or config.diagnostics.checkpoint_stats)
+    if active:
+        from openwam.optimizations.mot import OptimizationMoTDriver
+
+        return OptimizationMoTDriver
+    from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
+
+    return DualSystemMoTDriver
 
 
 def stage_training_indices(indices, device):

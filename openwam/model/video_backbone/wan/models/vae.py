@@ -4,25 +4,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
-from openwam.optimizations import enabled, pointwise
-
 CACHE_T = 2
-
-
-def _layout(x):
-    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") and x.ndim == 5:
-        from openwam.optimizations.vae_layout import channels_last
-
-        return channels_last(x)
-    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") and x.ndim == 4:
-        return x.contiguous(memory_format=torch.channels_last)
-    return x
-
-
-def _clone_cache(x):
-    if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST") and x.ndim == 5:
-        return x.clone(memory_format=torch.channels_last_3d)
-    return x.clone()
 
 
 def check_is_instance(model, module_class):
@@ -49,9 +31,9 @@ class CausalConv3d(nn.Conv3d):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-        x = _layout(F.pad(x, padding))
+        x = F.pad(x, padding)
 
-        return _layout(super().forward(x))
+        return super().forward(x)
 
 
 class RMS_norm(nn.Module):
@@ -66,10 +48,6 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        if enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE"):
-            return pointwise.vae_normalize(
-                x, self.gamma, self.bias, 1 if self.channel_first else -1, self.scale
-            )
         return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
 
 
@@ -116,7 +94,7 @@ class Resample(nn.Module):
                     feat_cache[idx] = "Rep"
                     feat_idx[0] += 1
                 else:
-                    cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
                     if cache_x.shape[2] < 2 and feat_cache[idx] is not None and feat_cache[idx] != "Rep":
                         # cache last frame of last two chunk
                         cache_x = torch.cat(
@@ -136,17 +114,17 @@ class Resample(nn.Module):
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, "b c t h w -> (b t) c h w")
-        x = self.resample(_layout(x))
-        x = _layout(rearrange(x, "(b t) c h w -> b c t h w", t=t))
+        x = self.resample(x)
+        x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
 
         if self.mode == "downsample3d":
             if feat_cache is not None:
                 idx = feat_idx[0]
                 if feat_cache[idx] is None:
-                    feat_cache[idx] = _clone_cache(x)
+                    feat_cache[idx] = x.clone()
                     feat_idx[0] += 1
                 else:
-                    cache_x = _clone_cache(x[:, :, -1:, :, :])
+                    cache_x = x[:, :, -1:, :, :].clone()
                     x = self.time_conv(torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
@@ -227,29 +205,10 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
-        skip_silu = False
-        for layer_id, layer in enumerate(self.residual):
-            if skip_silu:
-                skip_silu = False
-                continue
-            if (
-                enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE")
-                and isinstance(layer, RMS_norm)
-                and layer_id + 1 < len(self.residual)
-                and isinstance(self.residual[layer_id + 1], nn.SiLU)
-            ):
-                x = pointwise.vae_normalize(
-                    x, layer.gamma, layer.bias, 1 if layer.channel_first else -1, layer.scale, apply_silu=True
-                )
-                if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
-                    x = _layout(x)
-                skip_silu = True
-                continue
+        for layer in self.residual:
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
-                if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
-                    x = _layout(x)
                 idx = feat_idx[0]
-                cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat(
@@ -260,10 +219,7 @@ class ResidualBlock(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
-        result = x + h
-        if enabled("OPENWAM_OPT_VAE_CHANNELS_LAST"):
-            result = _layout(result)
-        return result, feat_cache, feat_idx
+        return x + h, feat_cache, feat_idx
 
 
 class AttentionBlock(nn.Module):
@@ -526,7 +482,7 @@ class Encoder3d(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
@@ -554,7 +510,7 @@ class Encoder3d(nn.Module):
         for layer in self.head:
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat(
@@ -624,7 +580,7 @@ class Encoder3d_38(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -657,7 +613,7 @@ class Encoder3d_38(nn.Module):
         for layer in self.head:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -726,7 +682,7 @@ class Decoder3d(nn.Module):
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
@@ -754,7 +710,7 @@ class Decoder3d(nn.Module):
         for layer in self.head:
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     # cache last frame of last two chunk
                     cache_x = torch.cat(
@@ -814,7 +770,7 @@ class Decoder3d_38(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 cache_x = torch.cat(
                     [
@@ -846,7 +802,7 @@ class Decoder3d_38(nn.Module):
         for layer in self.head:
             if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = _clone_cache(x[:, :, -CACHE_T:, :, :])
+                cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                     cache_x = torch.cat(
                         [
@@ -1191,34 +1147,18 @@ class WanVideoVAE(nn.Module):
         Returns:
             (B, z_dim, T_lat, H_lat, W_lat) latent tensor, z-score normalized.
         """
-        videos = _layout(videos.to(device))
+        videos = videos.to(device)
         with torch.no_grad():
-            return self.model.encode(videos, self._scale_for(videos))
-
-    def prepare_scale_cache(self):
-        parameter = next(self.model.parameters())
-        for index, scale in enumerate(self.scale):
-            self.register_buffer(
-                f"_openwam_scale_{index}", scale.to(device=parameter.device, dtype=parameter.dtype), persistent=False
-            )
-
-    def _scale_for(self, x):
-        if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
-            # Also supports direct encoder calls outside the trainer. Initialize
-            # before the encoder launches kernels, then reuse nonpersistent buffers.
-            if not hasattr(self, "_openwam_scale_0"):
-                self.prepare_scale_cache()
-            return [getattr(self, f"_openwam_scale_{i}").to(device=x.device, dtype=x.dtype) for i in range(2)]
-        return self.scale
+            return self.model.encode(videos, self.scale)
 
     def single_encode(self, video, device):
-        video = _layout(video.to(device))
-        x = self.model.encode(video, self._scale_for(video))
+        video = video.to(device)
+        x = self.model.encode(video, self.scale)
         return x
 
     def single_decode(self, hidden_state, device):
         hidden_state = hidden_state.to(device)
-        video = self.model.decode(hidden_state, self._scale_for(hidden_state))
+        video = self.model.decode(hidden_state, self.scale)
         return video.clamp_(-1, 1)
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
@@ -1284,7 +1224,7 @@ class VideoVAE38_(VideoVAE_):
 
     def encode(self, x, scale):
         self.clear_cache()
-        x = _layout(patchify(x, patch_size=2))
+        x = patchify(x, patch_size=2)
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         for i in range(iter_):

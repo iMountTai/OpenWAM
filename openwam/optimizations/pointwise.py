@@ -20,11 +20,11 @@ def _run(fn, *args):
 
     if extras_enabled():
         return run_pointwise(fn, *args)
-    if torch.compiler.is_compiling() and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+    if torch.compiler.is_compiling() and enabled("compile"):
         # The enclosing block already compiles this expression. A nested
         # dispatch would specialize this shared helper for every expression.
         return fn(*args)
-    if args[0].is_cuda and enabled("OPENWAM_OPT_POINTWISE_COMPILE"):
+    if args[0].is_cuda and enabled("compile.pointwise"):
         return _compiled(fn)(*args)
     return fn(*args)
 
@@ -35,7 +35,7 @@ def _rms(x, weight, eps):
 
 
 def rms_norm(x, weight, eps):
-    if enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+    if enabled("dtk.lightop_norm"):
         from openwam.optimizations.norms import lightop_rms_norm
 
         result = lightop_rms_norm(x, weight, eps)
@@ -63,10 +63,10 @@ def _compiled_vae_norm(dim, scale, rank, apply_silu):
 
 
 def vae_normalize(x, gamma, bias, dim, scale, apply_silu=False):
-    if torch.compiler.is_compiling() and enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+    if torch.compiler.is_compiling() and enabled("compile"):
         normalize = _vae_norm_silu_value if apply_silu else _vae_norm_value
         return normalize(x, gamma, bias, dim, scale)
-    if x.is_cuda and enabled("OPENWAM_OPT_VAE_POINTWISE_COMPILE"):
+    if x.is_cuda and enabled("compile.vae_pointwise"):
         from torch._dynamo import mark_static
 
         if x.ndim == 5 and dim == 1 and x.is_contiguous(memory_format=torch.channels_last_3d):

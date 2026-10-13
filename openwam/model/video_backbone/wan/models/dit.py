@@ -104,7 +104,7 @@ def _flash_attention_impl(q, k, v, num_heads, compatibility_mode=False, attn_mas
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+    if enabled("compile.pointwise") or extras_enabled():
         return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
@@ -136,7 +136,7 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    if enabled("OPENWAM_OPT_ROPE_REAL"):
+    if enabled("rope_real"):
         return pointwise.rotate(x, freqs).flatten(2)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
@@ -153,7 +153,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+        if enabled("compile.pointwise") or enabled("dtk.lightop_norm"):
             return pointwise.rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
@@ -246,7 +246,7 @@ class GateModule(nn.Module):
         super().__init__()
 
     def forward(self, x, gate, residual):
-        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+        if enabled("compile.pointwise") or extras_enabled():
             return pointwise.gate(x, gate, residual)
         return x + gate * residual
 
@@ -260,9 +260,10 @@ class DiTBlock(nn.Module):
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=has_image_input)
-        self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = LayerNorm(dim, eps=eps)
+        norm_type = LayerNorm if enabled("dtk.lightop_norm") else nn.LayerNorm
+        self.norm1 = norm_type(dim, eps=eps, elementwise_affine=False)
+        self.norm2 = norm_type(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = norm_type(dim, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()

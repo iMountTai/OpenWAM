@@ -119,7 +119,7 @@ def _train(cfg: DictConfig) -> None:
 def _train_openwam(cfg: DictConfig) -> None:
     """Original OpenWAM training path."""
     from openwam.dataloader.registry import build_dataset
-    from openwam.train.openwam_trainer import OpenWAMTrainer
+    from openwam.optimizations import create_trainer
     from openwam.train.utils.seeding import seed_everything
 
     # Seed Python random / numpy / torch BEFORE dataset construction so that
@@ -139,7 +139,7 @@ def _train_openwam(cfg: DictConfig) -> None:
     dataset = build_dataset(cfg.dataloader, split="train")
 
     # Build trainer and run
-    trainer = OpenWAMTrainer(cfg, accelerator=accelerator, dataset=dataset)
+    trainer = create_trainer(cfg, accelerator=accelerator, dataset=dataset)
     trainer.train()
 
 
@@ -167,7 +167,7 @@ def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
     from openwam.optimizations import configure_backends
 
-    configure_backends()
+    configure_backends(cfg.get("optimizations"))
 
     try:
         _train(cfg)

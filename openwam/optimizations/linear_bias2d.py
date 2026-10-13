@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from openwam.optimizations import enabled
+from openwam.optimizations.dtk import enabled as dtk_enabled
 from openwam.optimizations.sac import dispatcher
 
 
@@ -31,7 +32,7 @@ def _native(module, kind):
 
 def can_use_bias2d(linear, x):
     # Return before backend/device queries in Dynamo. GLOBAL keeps its boundary.
-    if (not enabled("OPENWAM_OPT_LINEAR_BIAS2D") or torch.compiler.is_compiling()
+    if (not enabled("dtk.linear_bias2d") or torch.compiler.is_compiling() or not dtk_enabled()
             or not _native(linear, nn.Linear) or _global_hooks()
             or not linear.training or not torch.is_grad_enabled()):
         return False
@@ -39,7 +40,7 @@ def can_use_bias2d(linear, x):
     if (type(x) is not torch.Tensor or type(weight) is not nn.Parameter or type(bias) is not nn.Parameter
             or not x.is_cuda or not weight.is_cuda or not bias.is_cuda
             or x.device != weight.device or x.device != bias.device
-            or torch.version.hip is None or torch.__version__.split("+")[0] != "2.7.1"
+            or torch.version.hip is None
             or x.dtype != torch.bfloat16 or weight.dtype != x.dtype or bias.dtype != x.dtype
             or torch.is_autocast_enabled(x.device.type)
             or not x.requires_grad or not weight.requires_grad or not bias.requires_grad
@@ -74,7 +75,7 @@ def _video_linear(linear, x):
 
 
 def cross_attention_kwargs(attention):
-    if not enabled("OPENWAM_OPT_LINEAR_BIAS2D") or torch.compiler.is_compiling():
+    if not enabled("dtk.linear_bias2d") or torch.compiler.is_compiling():
         return {}
     from openwam.model.video_backbone.wan.models.dit import CrossAttention
 
@@ -86,7 +87,7 @@ def cross_attention_kwargs(attention):
 
 def video_ffn(ffn, x):
     # Manual children must not bypass a Sequential hook or custom forward.
-    if (not enabled("OPENWAM_OPT_LINEAR_BIAS2D") or torch.compiler.is_compiling()
+    if (not enabled("dtk.linear_bias2d") or torch.compiler.is_compiling()
             or not _native(ffn, nn.Sequential) or len(ffn) != 3 or _global_hooks()
             or not _native(ffn[0], nn.Linear) or not _native(ffn[1], nn.GELU)
             or ffn[1].approximate != "tanh" or not _native(ffn[2], nn.Linear)):

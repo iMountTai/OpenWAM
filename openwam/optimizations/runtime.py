@@ -1,14 +1,13 @@
 """Validated optional runtime knobs; absent flags preserve caller configuration."""
 
-import os
+from openwam.optimizations.config import option, settings
 
 
 def integer(name, default, minimum=0):
-    raw = os.environ.get(name, str(default))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    raw = option(name)
+    value = default if raw is None else raw
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"optimizations.{name} must be an integer, got {raw!r}")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}, got {value}")
     return value
@@ -16,14 +15,11 @@ def integer(name, default, minimum=0):
 
 def checkpoint_skip_layers():
     """Number of trailing layers without checkpointing; unset/false means zero."""
-    name = "OPENWAM_OPT_PARTIAL_CHECKPOINT"
-    if os.environ.get(name, "").strip().lower() in {"", "false", "no", "off"}:
-        return 0
-    return integer(name, 0)
+    return settings().checkpoint_skip_layers
 
 
 def checkpoint_layers(total):
     skip = checkpoint_skip_layers()
     if skip > total:
-        raise ValueError(f"OPENWAM_OPT_PARTIAL_CHECKPOINT={skip} exceeds model layers={total}")
+        raise ValueError(f"checkpoint_skip_layers={skip} exceeds model layers={total}")
     return total - skip
