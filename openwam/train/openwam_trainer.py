@@ -475,7 +475,12 @@ class OpenWAMTrainer:
                         loss = losses["total"]
                         self.accelerator.backward(loss)
 
-                        grad_norm = torch.tensor(0.0, device=loss.device)
+                        # DeepSpeed may already have queued step-end AllGather
+                        # inside backward. A host scalar upload would wait for it.
+                        grad_norm = (
+                            torch.zeros((), device=loss.device, dtype=torch.float32)
+                            if lagged is not None else torch.tensor(0.0, device=loss.device)
+                        )
                         if self.accelerator.sync_gradients:
                             if max_grad_norm is not None:
                                 grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
