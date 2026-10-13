@@ -28,8 +28,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 
 
-class _Windows(torch.utils.data.Dataset):
-    """Decoded frames of (reader, episode, start) windows, in episode order."""
+class _Episodes(torch.utils.data.Dataset):
+    """All frames of one episode, decoded and assembled once (uint8 [L, H, W, 3]).
+
+    Consecutive windows overlap in all but one frame; decoding per window would
+    repeat every JPEG decode and multiview assembly about num_frames times.
+    """
 
     def __init__(self, readers, items):
         self.readers, self.items = readers, items
@@ -38,8 +42,40 @@ class _Windows(torch.utils.data.Dataset):
         return len(self.items)
 
     def __getitem__(self, index):
-        reader, episode, start = self.items[index]
-        return self.items[index], self.readers[reader]._build_sample(episode, start)["video"]
+        r, e = self.items[index]
+        return r, e, torch.from_numpy(_episode_frames(self.readers[r], e))
+
+
+def _episode_frames(reader, ep_idx):
+    """The frames RoboTwinDataset._build_sample would sample from, for the whole episode."""
+    import h5py
+
+    from openwam.dataloader.transforms.multiview import crop_and_resize
+
+    length = reader._episode_lengths[ep_idx]
+    with h5py.File(reader._episode_files[ep_idx], "r") as f:
+        if reader.multiview:
+            frames = reader._read_multiview_frames(f, reader.cameras, 0, length)
+        else:
+            frames = [crop_and_resize(frame, reader.height, reader.width)
+                      for frame in reader._read_camera_frames(f, reader.target_camera, 0, length)]
+    if any(frame.mode != "RGB" for frame in frames):
+        raise ValueError(f"Expected RGB frames in {reader._episode_files[ep_idx]}")
+    return np.stack([np.asarray(frame, dtype=np.uint8) for frame in frames])
+
+
+def _window_pixels(frames, reader, start, dtype, min_value=-1, max_value=1):
+    """Same tensor as wan_encode.preprocess_video(_build_sample(...)["video"]).
+
+    A window past the episode end repeats the last frame, as _build_sample pads.
+    The arithmetic matches preprocess_video's uint8 path; its float32 path gives
+    identical values because 0..255 are exact in BF16.
+    """
+    last = frames.shape[0] - 1
+    index = torch.tensor([min(start + i, last) for i in reader._video_sample_indices], device=frames.device)
+    pixels = frames.index_select(0, index).to(dtype=dtype)
+    pixels = pixels * ((max_value - min_value) / 255) + min_value
+    return pixels.permute(3, 0, 1, 2).unsqueeze(0)
 
 
 def _write(path, rows):
@@ -103,35 +139,51 @@ def main(cfg: DictConfig) -> None:
                 if store.episode_starts(reader, e)]
     mine = [(r, e) for r, e in episodes[rank::world]
             if not _finished(store.episode_path(root, readers[r], e), len(store.episode_starts(readers[r], e)))]
-    items = [(r, e, start) for r, e in mine for start in store.episode_starts(readers[r], e)]
+    total = sum(len(store.episode_starts(readers[r], e)) for r, e in mine)
     logger.info("[latent store] rank %d/%d: %d of %d episodes to encode, %d windows",
-                rank, world, len(mine), len(episodes[rank::world]), len(items))
+                rank, world, len(mine), len(episodes[rank::world]), total)
+    workers = min(int(cfg.training.dataset_num_workers), 4)  # Whole episodes are large in shared memory.
     loader = torch.utils.data.DataLoader(
-        _Windows(readers, items), batch_size=int(cfg.training.batch_size), shuffle=False,
-        num_workers=int(cfg.training.dataset_num_workers), collate_fn=list,
+        _Episodes(readers, mine), batch_size=None, shuffle=False, num_workers=workers,
+        **({"prefetch_factor": 2} if workers else {}),
     )
+    batch_size = int(cfg.training.batch_size)
+    resident, rows, pending = {}, {}, []
+    done, batches, started = 0, 0, time.monotonic()
 
-    current, rows, done, batches, started = None, [], 0, 0, time.monotonic()
+    def encode(windows):
+        nonlocal done, batches
+        real = len(windows)
+        # Pad the tail so the compiled encoder only ever sees one batch size.
+        windows = windows + [windows[-1]] * (batch_size - real)
+        pixels = torch.cat([_window_pixels(resident[key], readers[key[0]], start, backbone.dtype)
+                            for key, start in windows])
+        latents = wan_encode.encode_video(pixels, vae=backbone.vae, encoder=None)
+        latents = latents.to(dtype=backbone.dtype).cpu()
+        for (key, _), latent in zip(windows[:real], latents[:real]):
+            rows[key].append(latent.contiguous())
+            if len(rows[key]) == len(store.episode_starts(readers[key[0]], key[1])):
+                _write(store.episode_path(root, readers[key[0]], key[1]), rows.pop(key))
+                del resident[key]
+        done += real
+        batches += 1
+        if rank == 0 and batches % 50 == 0:
+            rate = done / (time.monotonic() - started)
+            logger.info("[latent store] rank 0: %d/%d windows, %.1f windows/s", done, total, rate)
+
     with torch.no_grad():
-        for batch in loader:
-            # Same calls as WanBase.preprocess_input_for_train's pixel path.
-            pixels = torch.cat([wan_encode.preprocess_video(frames, encoder=None, dtype=backbone.dtype,
-                                                            device=backbone.device) for _, frames in batch])
-            latents = wan_encode.encode_video(pixels, vae=backbone.vae, encoder=None)
-            latents = latents.to(dtype=backbone.dtype).cpu()
-            for ((r, e, _), _), latent in zip(batch, latents):
-                if (r, e) != current:
-                    if current is not None:
-                        _write(store.episode_path(root, readers[current[0]], current[1]), rows)
-                    current, rows = (r, e), []
-                rows.append(latent.contiguous())
-            done += len(batch)
-            batches += 1
-            if rank == 0 and batches % 50 == 0:
-                rate = done / (time.monotonic() - started)
-                logger.info("[latent store] rank 0: %d/%d windows, %.1f windows/s", done, len(items), rate)
-    if current is not None:
-        _write(store.episode_path(root, readers[current[0]], current[1]), rows)
+        for r, e, frames in loader:
+            key = (r, e)
+            resident[key] = frames.pin_memory().to(device=device, non_blocking=True)
+            rows[key] = []
+            pending.extend((key, start) for start in store.episode_starts(readers[r], e))
+            while len(pending) >= batch_size:
+                encode(pending[:batch_size])
+                pending = pending[batch_size:]
+        if pending:
+            encode(pending)
+    if rows:
+        raise RuntimeError(f"Unfinished episodes after encoding: {sorted(rows)}")
     logger.info("[latent store] rank %d finished %d windows in %.0f s", rank, done, time.monotonic() - started)
 
 
