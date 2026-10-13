@@ -1,35 +1,11 @@
-# Candidate matching the supplied configuration; runtime/performance validation required.
+# Native Wan/ZeRO-2 performance preset plus DTK-only settings.
 defaults:
-  - default
+  - performance
   - _self_
 
-vae_channels_last: true
-constant_cache: true
-text_cache: true
-fa2_padding: true
-fa2_mask_fused: true
-padding_plan_cpu: true
-mot_split_attn: true
-rope_real: true
-zero_overlap: true
-checkpoint_skip_layers: 12  # For 30 layers: first 18 checkpoint, last 12 do not.
-uint8_preprocess: true
-t5_prefix: true
-text_trim: true
-zero_reduce_scatter: true
-online_encode: true
-fused_adamw: true
-host_async: true
-
 compile:
-  mot: true
-  vae: true
-  pointwise: true
-  vae_pointwise: true
   threads: 1
-
-sac:
-  ffn_full: true
+  coordinate_descent_tuning: true
 
 dtk:
   enabled: true
@@ -39,7 +15,3 @@ dtk:
   blas_prefer_hipblaslt: true
   allow_tf32: true
   fine_grain_pcie: true
-
-# Performance timing defaults to no profiler. Override ranks=rank0 or all for traces.
-profiling:
-  ranks: 'off'

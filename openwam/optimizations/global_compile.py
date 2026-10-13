@@ -10,6 +10,18 @@ from openwam.optimizations.config import settings
 logger = logging.getLogger(__name__)
 
 
+def configure_inductor():
+    """Apply the optional tuning setting by capability, without a Torch version pin."""
+    from torch._inductor import config
+
+    requested = settings().compile.coordinate_descent_tuning
+    if not hasattr(config, "coordinate_descent_tuning"):
+        if requested:
+            raise RuntimeError("optimizations.compile.coordinate_descent_tuning is unsupported by this Torch build")
+        return
+    config.coordinate_descent_tuning = requested
+
+
 def compile_scope():
     config = settings().compile
     return {name for name in ("mot", "vae") if getattr(config, name)}

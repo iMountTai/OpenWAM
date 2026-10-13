@@ -1,16 +1,17 @@
-# All options are independent and off by default on every platform.
+# Conservative defaults on every platform; baseline disables the two data fast paths.
 vae_channels_last: false
 constant_cache: false
-text_cache: false
+text_cache: false  # Bounded online prompt LRU; independent of offline text caching.
+offline_text_cache: false
 text_cache_size: 32
+text_cache_dir: null  # Offline T5 store; otherwise uses latent-cache-dir/text when a latent directory is configured.
 fa2_padding: false
-fa2_mask_fused: false
-padding_plan_cpu: false
+padding_plan_cpu: true
 mot_split_attn: false
 rope_real: false
 zero_overlap: false
 checkpoint_skip_layers: 0
-uint8_preprocess: false
+uint8_preprocess: true
 t5_prefix: false
 text_trim: false
 zero_reduce_scatter: false
@@ -25,7 +26,9 @@ compile:
   vae: false
   pointwise: false
   vae_pointwise: false
+  attention_mask: false
   threads: null
+  coordinate_descent_tuning: false
 
 sac:
   attention: false

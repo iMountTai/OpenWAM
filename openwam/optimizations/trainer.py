@@ -60,6 +60,12 @@ class OptimizationTrainer(NativeTrainer):
             arch.video_backbone.vae.to(device="cpu")
             torch.cuda.empty_cache()
             logger.info("[optimizations] VAE kept on CPU; training reads stored latents")
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            text_store.offload(arch.video_backbone)
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] T5 weights moved to CPU for offline text caching")
         if enabled("host_async"):
             from openwam.optimizations.host_async import stage_rope_tables
 
@@ -251,6 +257,13 @@ class OptimizationTrainer(NativeTrainer):
             arch = self.accelerator.unwrap_model(self.architecture)
             validate_backbone(arch)
             attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            # Resume has restored weights; validate before workers start and
+            # before any lookahead encoding can read an offline context.
+            arch = self.accelerator.unwrap_model(self.architecture)
+            text_store.attach(self.dataset, arch.video_backbone)
         lagged = None
         if enabled("host_async"):
             from openwam.optimizations.host_async import LaggedMetrics, device_scalar
@@ -299,7 +312,10 @@ class OptimizationTrainer(NativeTrainer):
                         loss = losses["total"]
                         self.accelerator.backward(loss)
 
-                        grad_norm = torch.tensor(0.0, device=loss.device)
+                        grad_norm = (
+                            torch.zeros((), device=loss.device, dtype=torch.float32)
+                            if lagged is not None else torch.tensor(0.0, device=loss.device)
+                        )
                         if self.accelerator.sync_gradients:
                             if max_grad_norm is not None:
                                 grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)

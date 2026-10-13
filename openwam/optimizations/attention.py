@@ -139,7 +139,7 @@ def _compiled_nonempty():
 
 
 def _mask_nonempty(out, nonempty):
-    if enabled("fa2_mask_fused"):
+    if enabled("compile.attention_mask"):
         return _compiled_nonempty()(out, nonempty)
     return out.masked_fill((~nonempty).view(-1, 1, 1), 0)
 

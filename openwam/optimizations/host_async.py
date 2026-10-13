@@ -32,10 +32,10 @@ def upload(tensor, device):
 
 
 def device_scalar(value, device):
-    """Grad norm as a device tensor without reading a device value on the host."""
+    """Detach device values or fill constants without a blocking scalar H2D."""
     if isinstance(value, torch.Tensor):
         return value.detach().to(device=device, dtype=torch.float32)
-    return torch.tensor(float(value), device=device, dtype=torch.float32)
+    return torch.full((), float(value), device=device, dtype=torch.float32)
 
 
 class LaggedMetrics:
@@ -48,7 +48,7 @@ class LaggedMetrics:
     def push(self, losses, grad_norm, info):
         device = losses["total"].device
         values = torch.stack([
-            torch.as_tensor(value, device=device).detach().float().reshape(())
+            device_scalar(value, device).reshape(())
             for value in (losses["total"], losses["video"], losses["action"], grad_norm)
         ])
         if self.accelerator is not None and self.accelerator.num_processes > 1:

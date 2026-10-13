@@ -117,6 +117,30 @@ def store_signature(dataset, vae):
             "readers": {reader_key(reader): reader_signature(reader) for reader in readers(dataset)}}
 
 
+def validate_signature(meta, expected):
+    """Allow task subsets, but reject any change affecting the stored latents."""
+    for name in ("version", "dtype", "vae"):
+        if meta.get(name) != expected[name]:
+            raise ValueError(f"VAE latent store {name} mismatch: stored {meta.get(name)!r}, run {expected[name]!r}")
+    stored = meta.get("readers", {})
+    for key, reader in expected["readers"].items():
+        previous = stored.get(key)
+        if previous is None:
+            tail = "/".join(reader["data_root"].replace("\\", "/").split("/")[-3:])
+            candidates = [value.get("data_root") for value in stored.values()
+                          if str(value.get("data_root", "")).replace("\\", "/").endswith("/" + tail)]
+            detail = f"; similar stored paths: {candidates}" if candidates else ""
+            raise ValueError(f"VAE latent store has no reader for {reader['data_root']}{detail}. "
+                             "Use the original dataset/cache paths or a new cache directory.")
+        changes = []
+        for name, value in reader.items():
+            if previous.get(name) != value:
+                old, new = repr(previous.get(name)), repr(value)
+                changes.append(f"{name}: stored {old[:160]}, run {new[:160]}")
+        if changes:
+            raise ValueError(f"VAE latent store reader mismatch for {reader['data_root']}: " + "; ".join(changes))
+
+
 class EpisodeLatents:
     """Per-worker lazy memory maps of the episode files of one reader."""
 
@@ -150,15 +174,10 @@ def attach(dataset, vae):
     with open(meta_path, encoding="utf-8") as handle:
         meta = json.load(handle)
     expected = store_signature(dataset, vae)
-    for name in ("version", "dtype", "vae"):
-        if meta.get(name) != expected[name]:
-            raise ValueError(f"VAE latent store {name} mismatch: stored {meta.get(name)!r}, run {expected[name]!r}")
+    validate_signature(meta, expected)
     shape = None
     for reader in readers(dataset):
         check_windows(reader)
-        key = reader_key(reader)
-        if meta["readers"].get(key) != expected["readers"][key]:
-            raise ValueError(f"VAE latent store was built with different reader settings for {reader.data_root}")
         for ep_idx in range(len(reader._episode_files)):
             starts = episode_starts(reader, ep_idx)
             if not starts:

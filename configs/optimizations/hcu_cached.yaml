@@ -1,0 +1,14 @@
+# Reproduce the supplied cached-latent run, including enable_profiling=1.
+# Requires matching VAE/T5 assets in the selected cache directory.
+defaults:
+  - hcu
+  - _self_
+
+vae_latent_cache: true
+vae_latent_cache_dir: ./assets/openwam_latents_blocks_ranking_size
+# Legacy TEXT_CACHE + latent directory selected the offline T5 store.
+text_cache: false
+offline_text_cache: true
+
+profiling:
+  ranks: rank0

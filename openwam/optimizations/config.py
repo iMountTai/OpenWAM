@@ -11,7 +11,9 @@ class CompileSettings:
     vae: bool = False
     pointwise: bool = False
     vae_pointwise: bool = False
+    attention_mask: bool = False
     threads: int | None = None
+    coordinate_descent_tuning: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,15 +54,16 @@ class OptimizationSettings:
     vae_channels_last: bool = False
     constant_cache: bool = False
     text_cache: bool = False
+    offline_text_cache: bool = False
     text_cache_size: int = 32
+    text_cache_dir: str | None = None
     fa2_padding: bool = False
-    fa2_mask_fused: bool = False
-    padding_plan_cpu: bool = False
+    padding_plan_cpu: bool = True
     mot_split_attn: bool = False
     rope_real: bool = False
     zero_overlap: bool = False
     checkpoint_skip_layers: int = 0
-    uint8_preprocess: bool = False
+    uint8_preprocess: bool = True
     t5_prefix: bool = False
     text_trim: bool = False
     zero_reduce_scatter: bool = False
@@ -113,10 +116,16 @@ def configure(config=None) -> OptimizationSettings:
             raise ValueError(f"optimizations.{path} must be >= {minimum}, got {value}")
     if candidate.profiling.ranks not in {"off", "rank0", "all"}:
         raise ValueError("optimizations.profiling.ranks must be off, rank0 or all")
+    for path in ("vae_latent_cache_dir", "text_cache_dir"):
+        value = getattr(candidate, path)
+        if value is not None and not value.strip():
+            raise ValueError(f"optimizations.{path} must be a non-empty path or null")
     if candidate.vae_latent_cache and not candidate.vae_latent_cache_dir:
         raise ValueError("optimizations.vae_latent_cache requires optimizations.vae_latent_cache_dir")
-    if candidate.fa2_mask_fused and not candidate.fa2_padding:
-        raise ValueError("optimizations.fa2_mask_fused requires fa2_padding=true")
+    if candidate.offline_text_cache and not (candidate.text_cache_dir or candidate.vae_latent_cache_dir):
+        raise ValueError("optimizations.offline_text_cache requires text_cache_dir or vae_latent_cache_dir")
+    if candidate.compile.attention_mask and not candidate.fa2_padding:
+        raise ValueError("optimizations.compile.attention_mask requires fa2_padding=true")
     dtk = candidate.dtk
     if not dtk.enabled and any((dtk.hw_queues is not None, dtk.lightop_norm, dtk.linear_bias2d, dtk.blas_prefer_hipblaslt,
                                dtk.allow_tf32, dtk.fine_grain_pcie)):

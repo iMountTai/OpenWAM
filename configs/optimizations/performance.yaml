@@ -1,0 +1,32 @@
+# Optional native Wan joint-training / ZeRO-2 candidate for CUDA or HIP.
+# Runtime support and performance still need validation on the selected backend.
+defaults:
+  - default
+  - _self_
+
+vae_channels_last: true
+constant_cache: true
+text_cache: true
+fa2_padding: true
+mot_split_attn: true
+rope_real: true
+zero_overlap: true
+checkpoint_skip_layers: 12  # Native 30-layer model: checkpoint the first 18.
+t5_prefix: true
+text_trim: true
+zero_reduce_scatter: true
+online_encode: true
+fused_adamw: true
+host_async: true
+
+compile:
+  mot: true
+  vae: true
+  pointwise: true
+  vae_pointwise: true
+  attention_mask: true
+  # Advanced tuning stays optional in the portable candidate.
+  coordinate_descent_tuning: false
+
+sac:
+  ffn_full: true

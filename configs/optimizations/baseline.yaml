@@ -1,0 +1,7 @@
+# Original all-off path for regression and numerical/performance comparisons.
+defaults:
+  - default
+  - _self_
+
+uint8_preprocess: false
+padding_plan_cpu: false

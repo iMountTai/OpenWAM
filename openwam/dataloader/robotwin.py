@@ -194,6 +194,33 @@ def _pad_and_resize(image: Image.Image, target_height: int, target_width: int) -
     return canvas
 
 
+def _prompt_choices(instructions: dict, ep_file: str, task_name: str):
+    """Raw prompt choices and whether the train reader samples them randomly."""
+    ep_num = os.path.basename(ep_file).replace("episode", "").replace(".hdf5", "")
+    key = f"episode{ep_num}.json"
+    instr = instructions.get(key)
+    if isinstance(instr, dict):
+        pool = instr.get("seen") or instr.get("unseen") or []
+        if pool:
+            return pool, True
+        base = instr.get("instruction")
+    elif isinstance(instr, str):
+        base = instr
+    elif isinstance(instr, list) and instr:
+        base = instr[0] if isinstance(instr[0], str) else str(instr[0])
+    else:
+        base = None
+    if base is None:
+        base = f"The bimanual robot is performing a {task_name} task."
+    return [base], False
+
+
+def _training_prompts(instructions: dict, ep_file: str, task_name: str) -> list[str]:
+    """Every prompt the train reader can emit, without consuming its RNG."""
+    choices, _ = _prompt_choices(instructions, ep_file, task_name)
+    return [format_prompt_for_inference(value) for value in choices]
+
+
 def _resolve_prompt(
     instructions: dict,
     ep_file: str,
@@ -222,31 +249,8 @@ def _resolve_prompt(
     Returns:
         The final wrapped prompt string that the model sees.
     """
-    ep_basename = os.path.basename(ep_file)
-    ep_num = ep_basename.replace("episode", "").replace(".hdf5", "")
-    instr_key = f"episode{ep_num}.json"
-
-    base_prompt = None
-    if instr_key in instructions:
-        instr = instructions[instr_key]
-        if isinstance(instr, dict):
-            # RoboTwin format: {"seen": [...], "unseen": [...]}
-            pool = instr.get("seen") or instr.get("unseen") or []
-            if pool:
-                if split == "train":
-                    base_prompt = random.choice(pool)
-                else:
-                    base_prompt = pool[0]
-            elif "instruction" in instr:
-                base_prompt = instr["instruction"]
-        elif isinstance(instr, str):
-            base_prompt = instr
-        elif isinstance(instr, list) and len(instr) > 0:
-            base_prompt = instr[0] if isinstance(instr[0], str) else str(instr[0])
-
-    if base_prompt is None:
-        base_prompt = f"The bimanual robot is performing a {task_name} task."
-
+    choices, randomize = _prompt_choices(instructions, ep_file, task_name)
+    base_prompt = random.choice(choices) if split == "train" and randomize else choices[0]
     return format_prompt_for_inference(base_prompt)
 
 
@@ -768,7 +772,7 @@ class RoboTwinDataset(BaseDataset):
                 f"(actual_raw_len={actual_raw_len}, ep_len={ep_len})."
             )
 
-        # A stored VAE latent replaces JPEG decoding (OPENWAM_OPT_VAE_LATENT_CACHE).
+        # A stored VAE latent replaces JPEG decoding when vae_latent_cache is enabled.
         latent_store = getattr(self, "_latent_store", None)
         with h5py.File(path, "r") as f:
             if latent_store is not None:

@@ -11,8 +11,9 @@ SWITCHES = (
     "vae_channels_last",
     "constant_cache",
     "text_cache",
+    "offline_text_cache",
     "fa2_padding",
-    "fa2_mask_fused",
+    "compile.attention_mask",
     "padding_plan_cpu",
     "mot_split_attn",
     "compile.pointwise",
@@ -60,6 +61,12 @@ def configure_backends(config=None) -> None:
     configure_dtk()  # Before anything can initialize the HIP runtime.
     if settings().compile.threads is not None:
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(settings().compile.threads)
+    compile_config = settings().compile
+    if any((compile_config.mot, compile_config.vae, compile_config.pointwise,
+            compile_config.vae_pointwise, compile_config.attention_mask, compile_config.coordinate_descent_tuning)):
+        from openwam.optimizations.global_compile import configure_inductor
+
+        configure_inductor()
     flags = {name: enabled(name) for name in SWITCHES}
     if not any(flags.values()) and not settings().sac.extra_ops:
         return

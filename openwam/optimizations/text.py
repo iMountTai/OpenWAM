@@ -141,6 +141,11 @@ def trim_text_context(inputs):
 
 
 def cached_text(prompts, *, tokenizer, text_encoder, device, encode):
+    if enabled("offline_text_cache"):
+        store = getattr(text_encoder, "_openwam_text_store", None)
+        if store is None:
+            raise RuntimeError("Offline T5 cache requested but not attached; initialize it before encoding training text")
+        return store(prompts, device)
     if not enabled("text_cache"):
         return encode(prompts)
     params = tuple(text_encoder.parameters())

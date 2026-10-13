@@ -1,7 +1,7 @@
 """Step 1 of the VAE latent store: encode every RoboTwin training window once.
 
-Use the same dataloader/model/optimizations overrides as the training run,
-plus the store directory (node-local disk is preferred)::
+Use the same dataloader/model/optimizations overrides as the
+training run, plus the store directory (node-local disk is preferred)::
 
     torchrun --nproc_per_node=8 scripts/cache_vae_latents.py optimizations=hcu dataloader=robotwin ... \\
         training.finetune_ckpt_path=... optimizations.vae_latent_cache_dir=/path/to/latents
@@ -10,6 +10,10 @@ Each rank encodes a disjoint set of episodes and writes one ``.npy`` per
 episode (atomic rename), so an interrupted run resumes by skipping finished
 files. Step 2 is the normal training command with
 optimizations.vae_latent_cache=true and the same vae_latent_cache_dir.
+
+With optimizations.offline_text_cache=true, also encode all possible training prompts with
+the frozen T5. optimizations.text_cache_dir defaults to the latent directory's
+``text`` subdirectory. Step 2 uses the same flag/directory and keeps T5 on CPU.
 """
 
 import json
@@ -100,9 +104,14 @@ def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
     from openwam.dataloader.registry import build_dataset
     from openwam.model.video_backbone.wan import encode as wan_encode
-    from openwam.optimizations import configure_backends, create_trainer, prepare_runtime_constants
+    from openwam.optimizations import configure_backends, create_trainer, enabled, prepare_runtime_constants, text_store
     from openwam.optimizations import latent_cache as store
 
+    # This command always generates from pixels, including when a training
+    # preset enables cached-latent reads. Never skip VAE preparation here.
+    from omegaconf import OmegaConf
+
+    OmegaConf.update(cfg, "optimizations.vae_latent_cache", False)
     configure_backends(cfg.get("optimizations"))
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -127,8 +136,9 @@ def main(cfg: DictConfig) -> None:
     meta_path = os.path.join(root, store.META)
     if os.path.isfile(meta_path):
         with open(meta_path, encoding="utf-8") as handle:
-            if json.load(handle) != signature:
-                raise ValueError(f"{meta_path} was written for different data/VAE settings; use a new directory")
+            # A store built for all tasks can resume a selected task without
+            # rewriting its metadata or invalidating the other cached readers.
+            store.validate_signature(json.load(handle), signature)
     elif rank == 0:
         os.makedirs(root, exist_ok=True)
         with open(f"{meta_path}.tmp", "w", encoding="utf-8") as handle:
@@ -185,6 +195,8 @@ def main(cfg: DictConfig) -> None:
     if rows:
         raise RuntimeError(f"Unfinished episodes after encoding: {sorted(rows)}")
     logger.info("[latent store] rank %d finished %d windows in %.0f s", rank, done, time.monotonic() - started)
+    if enabled("offline_text_cache"):
+        text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
 
 
 if __name__ == "__main__":
