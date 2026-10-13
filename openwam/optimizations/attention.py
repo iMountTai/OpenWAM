@@ -220,14 +220,21 @@ def split_attention(q, k, v, mask, num_heads, attention_fn):
     # Reject plans after in-place edits to an otherwise identical-shaped mask.
     if mask._version != getattr(mask, "_openwam_split_version", None):
         return None
+    # Plan rows partition the query axis in order. split() backpropagates with
+    # one concatenation; per-row slices would each allocate, zero-fill and
+    # accumulate a full-size gradient. Full-range keys/values are used as-is.
+    queries = q.split([stop - start for start, stop, _ in plan], dim=1)
+
+    def whole(x, left, right):
+        return x if left == 0 and right == x.shape[1] else x[:, left:right]
+
     outputs = []
-    for start, stop, ranges in plan:
-        query = q[:, start:stop]
+    for query, (start, stop, ranges) in zip(queries, plan):
         if not ranges:
             outputs.append(query * 0 + (k.sum() + v.sum()) * 0)
             continue
-        keys = [k[:, left:right] for left, right in ranges]
-        values = [v[:, left:right] for left, right in ranges]
+        keys = [whole(k, left, right) for left, right in ranges]
+        values = [whole(v, left, right) for left, right in ranges]
         keys = keys[0] if len(keys) == 1 else torch.cat(keys, dim=1)
         values = values[0] if len(values) == 1 else torch.cat(values, dim=1)
         outputs.append(attention_fn(query, keys, values, num_heads=num_heads))

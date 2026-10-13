@@ -14,6 +14,7 @@ from torch import Tensor
 
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
+from openwam.optimizations.host_async import active as host_async_active, upload
 from openwam.optimizations.text import cached_text, t5_prefix_plan
 from openwam.optimizations import enabled
 
@@ -47,8 +48,14 @@ def _encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Ten
         stop, cpu_lengths = prefix
         ids = ids[:, :stop].contiguous()
         mask = mask[:, :stop].contiguous()
-    ids = ids.to(device)
-    mask = mask.to(device)
+    if host_async_active():
+        # A blocking pageable copy waits for every queued kernel, including the
+        # optimizer step this encode is meant to overlap.
+        ids = upload(ids, device)
+        mask = upload(mask, device)
+    else:
+        ids = ids.to(device)
+        mask = mask.to(device)
     seq_lens = host_lengths if cpu_plan else mask.gt(0).sum(dim=1).long()
     context = text_encoder(ids, mask)
     lengths_to_zero = host_lengths.tolist() if cpu_plan else (seq_lens if prefix is None else cpu_lengths)

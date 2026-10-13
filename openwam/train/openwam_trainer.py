@@ -391,6 +391,17 @@ class OpenWAMTrainer:
                     skip_first,
                 )
 
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_VAE_LATENT_CACHE"):
+            from openwam.optimizations.latent_cache import attach, vae_fingerprint, validate_backbone
+
+            # After finetune/resume weights are in place and before DataLoader
+            # workers fork (they start at the first iteration).
+            arch = self.accelerator.unwrap_model(self.architecture)
+            validate_backbone(arch)
+            attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
+
         _step_t0 = _time.monotonic()
         pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
@@ -416,6 +427,23 @@ class OpenWAMTrainer:
             from openwam.optimizations.gc_trace import GCTrace
 
             gc_trace = GCTrace(output_path, self._rank)
+        lagged = None
+        if enabled("OPENWAM_OPT_HOST_ASYNC"):
+            from openwam.optimizations.host_async import LaggedMetrics, device_scalar
+
+            lagged = LaggedMetrics(self.accelerator)
+
+        def report(info, metrics):
+            self.log_step(
+                metrics=metrics, **info, batch_size=batch_size, pbar=pbar, wandb_run=wandb_run,
+                debug=debug, output_path=output_path,
+            )
+
+        def flush_metrics():
+            if lagged is not None:
+                for info, metrics in lagged.flush():
+                    report(info, metrics)
+
         with (prof_context as prof,
               online if online is not None else contextlib.nullcontext(),
               gc_trace if gc_trace is not None else contextlib.nullcontext()):
@@ -451,7 +479,10 @@ class OpenWAMTrainer:
                         if self.accelerator.sync_gradients:
                             if max_grad_norm is not None:
                                 grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
-                                grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
+                                if lagged is not None:
+                                    grad_norm = device_scalar(grad_norm_val, loss.device)
+                                else:
+                                    grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
                             optimizer.step()
                             if scheduler is not None:
                                 scheduler.step()
@@ -464,26 +495,18 @@ class OpenWAMTrainer:
                     if prof is not None:
                         prof.step()
 
-                    metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
-
                     current_lr = optimizer.param_groups[0]["lr"]
                     _now = _time.monotonic()
                     steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
                     _step_t0 = _now
-
-                    self.log_step(
-                        metrics=metrics,
-                        global_step=global_step,
-                        opt_step=opt_step,
-                        epoch=epoch,
-                        lr=current_lr,
-                        steps_per_sec=steps_per_sec,
-                        batch_size=batch_size,
-                        pbar=pbar,
-                        wandb_run=wandb_run,
-                        debug=debug,
-                        output_path=output_path,
-                    )
+                    info = dict(global_step=global_step, opt_step=opt_step, epoch=epoch, lr=current_lr,
+                                steps_per_sec=steps_per_sec)
+                    if lagged is None:
+                        report(info, reduce_step_metrics(self.accelerator, losses, grad_norm))
+                    else:
+                        # Logged one step late so the host never waits for this step's values.
+                        for ready_info, metrics in lagged.push(losses, grad_norm, info):
+                            report(ready_info, metrics)
 
                     # save_steps: write the weights line (+ the resumable full state when
                     # save_full_states_for_resume=true), then prune in lockstep.
@@ -495,10 +518,12 @@ class OpenWAMTrainer:
                             manage_checkpoints(output_path, keep_last_k)
 
                     if max_steps and global_step >= max_steps:
+                        flush_metrics()
                         pbar.close()
                         self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                         return
 
+            flush_metrics()
             pbar.close()
             self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
 
@@ -512,7 +537,14 @@ class OpenWAMTrainer:
             video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
         )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
-        return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
+        from openwam.optimizations import enabled
+
+        # One fused kernel per tensor group instead of seven foreach passes over
+        # the fp32 ZeRO partition; same AdamW update, rounding may differ slightly.
+        extra = {"fused": True} if enabled("OPENWAM_OPT_FUSED_ADAMW") else {}
+        return torch.optim.AdamW(
+            params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas, **extra
+        )
 
     # (4) Called by train() — build the training DataLoader (seeded generator when reproducible).
     def build_dataloader(self, batch_size: int) -> torch.utils.data.DataLoader:
@@ -651,9 +683,18 @@ class OpenWAMTrainer:
         arch = self.accelerator.unwrap_model(self.architecture)
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
-        arch.move_frozen_to_device(self.accelerator.device)
-        prepare_runtime_constants(arch)
         from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_VAE_LATENT_CACHE"):
+            # Stored latents replace the VAE. DeepSpeed moved the whole module to
+            # the device; return the frozen VAE to the CPU and release its memory.
+            arch.move_frozen_to_device(self.accelerator.device, names=("text_encoder",))
+            arch.video_backbone.vae.to(device="cpu")
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] VAE kept on CPU; training reads stored latents")
+        else:
+            arch.move_frozen_to_device(self.accelerator.device)
+        prepare_runtime_constants(arch)
 
         if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
             from openwam.optimizations.zero import install_reduce_scatter

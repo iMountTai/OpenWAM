@@ -30,6 +30,9 @@ SWITCHES = (
     "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
     "OPENWAM_OPT_ONLINE_ENCODE",
     "OPENWAM_OPT_HW_QUEUES",
+    "OPENWAM_OPT_VAE_LATENT_CACHE",
+    "OPENWAM_OPT_FUSED_ADAMW",
+    "OPENWAM_OPT_HOST_ASYNC",
 )
 
 
@@ -62,6 +65,10 @@ def configure_backends() -> None:
     from openwam.optimizations.sac import validate
 
     validate()
+    if flags["OPENWAM_OPT_VAE_LATENT_CACHE"]:
+        from openwam.optimizations.latent_cache import directory
+
+        directory()
     if flags["OPENWAM_OPT_VAE_CHANNELS_LAST"]:
         from openwam.optimizations.vae_layout import validate as validate_layout
 
@@ -89,6 +96,10 @@ def configure_backends() -> None:
 
 
 def configure_zero(config: dict) -> None:
+    if enabled("OPENWAM_OPT_HOST_ASYNC"):
+        from openwam.optimizations.host_async import configure_deepspeed
+
+        configure_deepspeed(config)
     if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER") or enabled("OPENWAM_OPT_ONLINE_ENCODE"):
         zero = config["zero_optimization"]
         if zero.get("stage") != 2:

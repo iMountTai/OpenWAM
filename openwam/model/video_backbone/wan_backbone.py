@@ -41,6 +41,7 @@ from openwam.model.video_backbone.wan.preprocess import (
     check_resize_height_width,
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
+from openwam.optimizations.host_async import rope_freqs
 from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 
 logger = logging.getLogger(__name__)
@@ -423,7 +424,7 @@ class WanBase(VideoBackbone):
 
         grid_frames, grid_height, grid_width = hidden_states.shape[2:]
         hidden_states = rearrange(hidden_states, "b c f h w -> b (f h w) c").contiguous()
-        freqs = (
+        freqs = rope_freqs(dit, (grid_frames, grid_height, grid_width), hidden_states.device, lambda: (
             torch.cat(
                 [
                     dit.freqs[0][:grid_frames]
@@ -439,8 +440,7 @@ class WanBase(VideoBackbone):
                 dim=-1,
             )
             .reshape(grid_frames * grid_height * grid_width, 1, -1)
-            .to(hidden_states.device)
-        )
+        ))
 
         extras = {
             "dit": dit,
@@ -771,10 +771,16 @@ class WanBase(VideoBackbone):
         device = self.device
         dtype = self.dtype
 
+        video_latents = kw.get("video_latents")
+        if video_latents is not None:
+            # Stored latents (OPENWAM_OPT_VAE_LATENT_CACHE): no pixels, no VAE.
+            num_frames, height, width = kw["video_size"]
+        else:
+            height, width, num_frames = frames[0][0].size[1], frames[0][0].size[0], len(frames[0])
         height, width, num_frames = check_resize_height_width(
-            frames[0][0].size[1],
-            frames[0][0].size[0],
-            len(frames[0]),
+            height,
+            width,
+            num_frames,
             height_division_factor=self._height_division_factor,
             width_division_factor=self._width_division_factor,
             time_division_factor=self._time_division_factor,
@@ -786,16 +792,20 @@ class WanBase(VideoBackbone):
             text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
         )
 
-        all_input_videos = []
-        for clip_frames in frames:
-            all_input_videos.append(
-                wan_encode.preprocess_video(
-                    clip_frames, encoder=self.video_encoder, dtype=self.dtype, device=self.device
+        stacked_inputs = None
+        if video_latents is not None:
+            input_latents = video_latents.to(dtype=dtype, device=device)
+        else:
+            all_input_videos = []
+            for clip_frames in frames:
+                all_input_videos.append(
+                    wan_encode.preprocess_video(
+                        clip_frames, encoder=self.video_encoder, dtype=self.dtype, device=self.device
+                    )
                 )
-            )
-        stacked_inputs = torch.cat(all_input_videos, dim=0)
-        input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
-        input_latents = input_latents.to(dtype=dtype, device=device)
+            stacked_inputs = torch.cat(all_input_videos, dim=0)
+            input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
+            input_latents = input_latents.to(dtype=dtype, device=device)
 
         # Variant-specific first-frame / control conditioning lives in
         # ``self._variant``, so this method carries no per-variant ``if``.
