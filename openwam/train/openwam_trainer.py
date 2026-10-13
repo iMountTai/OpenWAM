@@ -402,6 +402,14 @@ class OpenWAMTrainer:
             validate_backbone(arch)
             attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
 
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            # Resume has restored weights by this point. Never serve a cache
+            # fingerprinted against the pre-resume encoder.
+            arch = self.accelerator.unwrap_model(self.architecture)
+            text_store.attach(self.dataset, arch.video_backbone)
+
         _step_t0 = _time.monotonic()
         pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
@@ -699,6 +707,12 @@ class OpenWAMTrainer:
             logger.info("[optimizations] VAE kept on CPU; training reads stored latents")
         else:
             arch.move_frozen_to_device(self.accelerator.device)
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            text_store.offload(arch.video_backbone)
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] T5 weights moved to CPU for offline text caching")
         prepare_runtime_constants(arch)
 
         if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):

@@ -11,6 +11,10 @@ Each rank encodes a disjoint set of episodes and writes one ``.npy`` per
 episode (atomic rename), so an interrupted run resumes by skipping finished
 files. Step 2 is the normal training command with
 OPENWAM_OPT_VAE_LATENT_CACHE=1 and the same OPENWAM_VAE_LATENT_CACHE_DIR.
+
+With OPENWAM_OPT_TEXT_CACHE=1, also encode all possible training prompts with
+the frozen T5. OPENWAM_TEXT_CACHE_DIR defaults to the latent directory's
+``text`` subdirectory. Step 2 uses the same flag/directory and keeps T5 on CPU.
 """
 
 import json
@@ -101,7 +105,7 @@ def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
     from openwam.dataloader.registry import build_dataset
     from openwam.model.video_backbone.wan import encode as wan_encode
-    from openwam.optimizations import configure_backends, prepare_runtime_constants
+    from openwam.optimizations import configure_backends, enabled, prepare_runtime_constants, text_store
     from openwam.optimizations import latent_cache as store
     from openwam.train.openwam_trainer import OpenWAMTrainer
 
@@ -187,6 +191,8 @@ def main(cfg: DictConfig) -> None:
     if rows:
         raise RuntimeError(f"Unfinished episodes after encoding: {sorted(rows)}")
     logger.info("[latent store] rank %d finished %d windows in %.0f s", rank, done, time.monotonic() - started)
+    if enabled("OPENWAM_OPT_TEXT_CACHE"):
+        text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
 
 
 if __name__ == "__main__":
