@@ -18,6 +18,8 @@ t5_prefix: true
 text_trim: true
 zero_reduce_scatter: true
 online_encode: true
+fused_adamw: true
+host_async: true
 
 compile:
   mot: true

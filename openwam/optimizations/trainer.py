@@ -34,6 +34,15 @@ class OptimizationTrainer(NativeTrainer):
 
         return build_profiler(output_path, self._rank)
 
+    def build_optimizer(self):
+        optimizer = super().build_optimizer()
+        if enabled("fused_adamw"):
+            # One fused kernel per parameter group instead of seven foreach
+            # passes over the fp32 ZeRO partition; the same AdamW update.
+            for group in (optimizer.defaults, *optimizer.param_groups):
+                group.update(foreach=None, fused=True)
+        return optimizer
+
     def build_dataloader(self, batch_size):
         loader = super().build_dataloader(batch_size)
         if enabled("padding_plan_cpu"):
@@ -45,6 +54,16 @@ class OptimizationTrainer(NativeTrainer):
     def prepare_accelerate(self, optimizer, dataloader, scheduler):
         result = super().prepare_accelerate(optimizer, dataloader, scheduler)
         arch = self.accelerator.unwrap_model(self.architecture)
+        if enabled("vae_latent_cache"):
+            # Stored latents replace the VAE. DeepSpeed moved the whole module to
+            # the device; return the frozen VAE to the CPU and release its memory.
+            arch.video_backbone.vae.to(device="cpu")
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] VAE kept on CPU; training reads stored latents")
+        if enabled("host_async"):
+            from openwam.optimizations.host_async import stage_rope_tables
+
+            stage_rope_tables(arch.video_backbone, self.accelerator.device)
         prepare_runtime_constants(arch)
         if enabled("zero_reduce_scatter"):
             from openwam.optimizations.zero import install_reduce_scatter
@@ -224,6 +243,31 @@ class OptimizationTrainer(NativeTrainer):
             from openwam.optimizations.gc_trace import GCTrace
 
             gc_trace = GCTrace(output_path, self._rank)
+        if enabled("vae_latent_cache"):
+            from openwam.optimizations.latent_cache import attach, vae_fingerprint, validate_backbone
+
+            # After finetune/resume weights are in place and before DataLoader
+            # workers fork (they start at the first iteration).
+            arch = self.accelerator.unwrap_model(self.architecture)
+            validate_backbone(arch)
+            attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
+        lagged = None
+        if enabled("host_async"):
+            from openwam.optimizations.host_async import LaggedMetrics, device_scalar
+
+            lagged = LaggedMetrics(self.accelerator)
+
+        def report(info, metrics):
+            self.log_step(
+                metrics=metrics, **info, batch_size=batch_size, pbar=pbar, wandb_run=wandb_run,
+                debug=debug, output_path=output_path,
+            )
+
+        def flush_metrics():
+            if lagged is not None:
+                for info, metrics in lagged.flush():
+                    report(info, metrics)
+
         with (prof_context as prof,
               online if online is not None else contextlib.nullcontext(),
               gc_trace if gc_trace is not None else contextlib.nullcontext()):
@@ -259,7 +303,10 @@ class OptimizationTrainer(NativeTrainer):
                         if self.accelerator.sync_gradients:
                             if max_grad_norm is not None:
                                 grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
-                                grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
+                                if lagged is not None:
+                                    grad_norm = device_scalar(grad_norm_val, loss.device)
+                                else:
+                                    grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
                             optimizer.step()
                             if scheduler is not None:
                                 scheduler.step()
@@ -272,26 +319,18 @@ class OptimizationTrainer(NativeTrainer):
                     if prof is not None:
                         prof.step()
 
-                    metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
-
                     current_lr = optimizer.param_groups[0]["lr"]
                     _now = _time.monotonic()
                     steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
                     _step_t0 = _now
-
-                    self.log_step(
-                        metrics=metrics,
-                        global_step=global_step,
-                        opt_step=opt_step,
-                        epoch=epoch,
-                        lr=current_lr,
-                        steps_per_sec=steps_per_sec,
-                        batch_size=batch_size,
-                        pbar=pbar,
-                        wandb_run=wandb_run,
-                        debug=debug,
-                        output_path=output_path,
-                    )
+                    info = dict(global_step=global_step, opt_step=opt_step, epoch=epoch, lr=current_lr,
+                                steps_per_sec=steps_per_sec)
+                    if lagged is None:
+                        report(info, reduce_step_metrics(self.accelerator, losses, grad_norm))
+                    else:
+                        # Logged one step late so the host never waits for this step's values.
+                        for ready_info, metrics in lagged.push(losses, grad_norm, info):
+                            report(ready_info, metrics)
 
                     # save_steps: write the weights line (+ the resumable full state when
                     # save_full_states_for_resume=true), then prune in lockstep.
@@ -303,9 +342,11 @@ class OptimizationTrainer(NativeTrainer):
                             manage_checkpoints(output_path, keep_last_k)
 
                     if max_steps and global_step >= max_steps:
+                        flush_metrics()
                         pbar.close()
                         self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                         return
 
+            flush_metrics()
             pbar.close()
             self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)

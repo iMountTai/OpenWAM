@@ -1,4 +1,4 @@
-"""Instance-local Wan projection/SAC adapter; keep the upstream backbone intact."""
+"""Instance-local Wan adapters (projection/SAC, stored latents); keep the upstream backbone intact."""
 
 from __future__ import annotations
 
@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, Tuple
 from torch import Tensor
 
 from openwam.model.video_backbone.wan import dit_forward as wan_dit_forward
+from openwam.model.video_backbone.wan import encode as wan_encode
 from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply
+from openwam.model.video_backbone.wan.preprocess import check_resize_height_width
 from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 
 if TYPE_CHECKING:
@@ -91,3 +93,71 @@ def prepare(backbone):
     for function in replacements:
         setattr(backbone, function.__name__, types.MethodType(function, backbone))
     backbone._openwam_wan_adapter = True
+
+
+def preprocess_stored_latents(self, *, frames=None, text=None, video_latents=None, video_size=None, **kw) -> dict:
+    """Native preprocessing with stored latents in place of pixels and the VAE.
+
+    Mirrors WanBase.preprocess_input_for_train: same resize check, text
+    encoding, TI2V conditioning and output keys. Batches without stored latents
+    go through the native method unchanged.
+    """
+    if video_latents is None:
+        return self._openwam_native_preprocess(frames=frames, text=text, **kw)
+    device = self.device
+    dtype = self.dtype
+    num_frames, height, width = video_size
+    height, width, num_frames = check_resize_height_width(
+        height,
+        width,
+        num_frames,
+        height_division_factor=self._height_division_factor,
+        width_division_factor=self._width_division_factor,
+        time_division_factor=self._time_division_factor,
+        time_division_remainder=self._time_division_remainder,
+    )
+    batch_size = len(frames)
+    context, seq_lens = wan_encode.encode_text(
+        text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+    )
+    input_latents = video_latents.to(dtype=dtype, device=device)
+    cond = self._variant.build_train_conditioning(
+        self,
+        input_latents=input_latents,
+        frames=frames,
+        ref_images=kw.get("ref_images"),
+        vace_videos=kw.get("vace_videos"),
+        stacked_inputs=None,
+        B=batch_size,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype,
+        first_frame_image=kw.get("first_frame_image"),
+    )
+    return {
+        "input_latents": input_latents,
+        "context": context,
+        "seq_lens": seq_lens,
+        "height": height,
+        "width": width,
+        "num_frames": num_frames,
+        "vace_context": cond.get("vace_context"),
+        "fuse_vae_embedding_in_latents": cond.get("fuse_vae_embedding_in_latents", False),
+        "num_clean_prefix_frames": cond.get("num_clean_prefix_frames", 0),
+        "first_frame_latents": cond.get("first_frame_latents"),
+        "clip_feature": cond.get("clip_feature"),
+        "y": cond.get("y"),
+    }
+
+
+def prepare_stored_latents(backbone):
+    """Route stored-latent batches around the VAE on this backbone instance only."""
+    if getattr(backbone, "_openwam_native_preprocess", None) is not None:
+        return
+    original = backbone.preprocess_input_for_train
+    if tuple(inspect.signature(original).parameters) != ("frames", "text", "kw"):
+        raise RuntimeError("Unsupported native Wan interface: preprocess_input_for_train")
+    backbone._openwam_native_preprocess = original
+    backbone.preprocess_input_for_train = types.MethodType(preprocess_stored_latents, backbone)

@@ -983,11 +983,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if any(ref_flags) and not all(ref_flags):
             raise ValueError("Mixed reference images in batch: all samples must be consistent.")
 
+        from openwam.optimizations.latent_cache import stacked
+
+        video_latents = stacked(samples)
+        stored = {}
+        if video_latents is not None:
+            from openwam.optimizations.host_async import upload
+
+            # Pinned non-blocking upload, so this can overlap the step-end collective.
+            stored = {"video_latents": upload(video_latents, _device), "video_size": samples[0]["video_size"]}
         preprocessed = self.preprocess(
             frames=all_frames,
             text=all_prompts,
             vace_videos=all_vace_videos,
             ref_images=all_ref_images if ref_flags[0] else None,
+            **stored,
         )
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None

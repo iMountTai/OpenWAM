@@ -15,6 +15,10 @@ t5_prefix: false
 text_trim: false
 zero_reduce_scatter: false
 online_encode: false
+fused_adamw: false
+host_async: false  # Drop per-step host syncs; step metrics are logged one step late.
+vae_latent_cache: false  # Read latents written by scripts/cache_vae_latents.py.
+vae_latent_cache_dir: null
 
 compile:
   mot: false

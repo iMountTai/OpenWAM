@@ -768,8 +768,12 @@ class RoboTwinDataset(BaseDataset):
                 f"(actual_raw_len={actual_raw_len}, ep_len={ep_len})."
             )
 
+        # A stored VAE latent replaces JPEG decoding (OPENWAM_OPT_VAE_LATENT_CACHE).
+        latent_store = getattr(self, "_latent_store", None)
         with h5py.File(path, "r") as f:
-            if self.multiview:
+            if latent_store is not None:
+                raw_frames = None
+            elif self.multiview:
                 raw_frames = self._read_multiview_frames(f, self.cameras, start, actual_raw_end)
             else:
                 raw_frames = self._read_camera_frames(f, self.target_camera, start, actual_raw_end)
@@ -778,7 +782,8 @@ class RoboTwinDataset(BaseDataset):
         # Pad to full window if the episode ended early
         if actual_raw_len < self._raw_window_len:
             pad_len = self._raw_window_len - actual_raw_len
-            raw_frames = raw_frames + [raw_frames[-1]] * pad_len
+            if raw_frames is not None:
+                raw_frames = raw_frames + [raw_frames[-1]] * pad_len
             raw_actions = np.concatenate(
                 [raw_actions, np.repeat(raw_actions[-1:], pad_len, axis=0)],
                 axis=0,
@@ -797,9 +802,12 @@ class RoboTwinDataset(BaseDataset):
             raw_actions, unify_dim_mask = map_to_unify(raw_actions.astype(np.float32), self._unify_dst_index, UNIFY_DIM)
 
         # Video: subsampled. State/action: raw rate.
-        sampled_video = [raw_frames[i] for i in self._video_sample_indices]
-        if not self.multiview:
-            sampled_video = [crop_and_resize(frame, self.height, self.width) for frame in sampled_video]
+        if raw_frames is None:
+            sampled_video = None
+        else:
+            sampled_video = [raw_frames[i] for i in self._video_sample_indices]
+            if not self.multiview:
+                sampled_video = [crop_and_resize(frame, self.height, self.width) for frame in sampled_video]
 
         proprio_np = raw_actions[0:1].astype(np.float32)
         action_np = raw_actions[1 : self.num_frames].astype(np.float32)
@@ -839,10 +847,19 @@ class RoboTwinDataset(BaseDataset):
         action_tensor = torch.from_numpy(action_np)
         proprio_tensor = torch.from_numpy(proprio_np)
 
+        extra = {}
+        if latent_store is not None:
+            from openwam.optimizations.latent_cache import FIRST_FRAME_FROM_LATENTS
+
+            extra = {
+                "video_latents": latent_store(ep_idx, start),
+                "video_size": (self.num_video_frames, self.height, self.width),
+            }
         return {
+            **extra,
             "video": sampled_video,
             "vace_video": None,
-            "first_frame_image": [sampled_video[0]],
+            "first_frame_image": [FIRST_FRAME_FROM_LATENTS] if sampled_video is None else [sampled_video[0]],
             "action": action_tensor,
             "action_mask": action_mask,
             "video_mask": video_mask,

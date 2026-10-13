@@ -65,6 +65,10 @@ class OptimizationSettings:
     text_trim: bool = False
     zero_reduce_scatter: bool = False
     online_encode: bool = False
+    fused_adamw: bool = False
+    host_async: bool = False
+    vae_latent_cache: bool = False
+    vae_latent_cache_dir: str | None = None
     compile: CompileSettings = field(default_factory=CompileSettings)
     sac: SACSettings = field(default_factory=SACSettings)
     dtk: DTKSettings = field(default_factory=DTKSettings)
@@ -109,6 +113,8 @@ def configure(config=None) -> OptimizationSettings:
             raise ValueError(f"optimizations.{path} must be >= {minimum}, got {value}")
     if candidate.profiling.ranks not in {"off", "rank0", "all"}:
         raise ValueError("optimizations.profiling.ranks must be off, rank0 or all")
+    if candidate.vae_latent_cache and not candidate.vae_latent_cache_dir:
+        raise ValueError("optimizations.vae_latent_cache requires optimizations.vae_latent_cache_dir")
     if candidate.fa2_mask_fused and not candidate.fa2_padding:
         raise ValueError("optimizations.fa2_mask_fused requires fa2_padding=true")
     dtk = candidate.dtk

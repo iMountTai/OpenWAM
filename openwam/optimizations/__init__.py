@@ -32,6 +32,9 @@ SWITCHES = (
     "zero_reduce_scatter",
     "online_encode",
     "dtk.hw_queues",
+    "fused_adamw",
+    "host_async",
+    "vae_latent_cache",
 )
 
 
@@ -81,6 +84,10 @@ def configure_backends(config=None) -> None:
 
 
 def configure_zero(config: dict) -> None:
+    if enabled("host_async"):
+        from openwam.optimizations.host_async import configure_deepspeed
+
+        configure_deepspeed(config)
     if enabled("zero_reduce_scatter") or enabled("online_encode"):
         zero = config["zero_optimization"]
         if zero.get("stage") != 2:
@@ -115,6 +122,14 @@ def prepare_model(architecture) -> None:
             from openwam.optimizations.wan import prepare as prepare_wan
 
             prepare_wan(backbone)
+    if enabled("vae_latent_cache"):
+        from openwam.model.video_backbone.wan_backbone import WanBase
+        from openwam.optimizations.wan import prepare_stored_latents
+
+        backbone = getattr(architecture, "video_backbone", None)
+        if not isinstance(backbone, WanBase):
+            raise ValueError("vae_latent_cache currently requires the native Wan video backbone")
+        prepare_stored_latents(backbone)
     if enabled("checkpoint_skip_layers"):
         if type(architecture).__name__ != "DualSystemSelfAttnArchitecture":
             raise ValueError("checkpoint_skip_layers currently requires dual_system/joint_self_attn")
