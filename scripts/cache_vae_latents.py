@@ -133,8 +133,9 @@ def main(cfg: DictConfig) -> None:
     meta_path = os.path.join(root, store.META)
     if os.path.isfile(meta_path):
         with open(meta_path, encoding="utf-8") as handle:
-            if json.load(handle) != signature:
-                raise ValueError(f"{meta_path} was written for different data/VAE settings; use a new directory")
+            # A store built for all tasks can resume a selected task without
+            # rewriting its metadata or invalidating the other cached readers.
+            store.validate_signature(json.load(handle), signature)
     elif rank == 0:
         os.makedirs(root, exist_ok=True)
         with open(f"{meta_path}.tmp", "w", encoding="utf-8") as handle:
