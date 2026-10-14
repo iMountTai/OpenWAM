@@ -1,7 +1,18 @@
-# Native Wan/ZeRO-2 performance preset plus DTK-only settings.
+# Native Wan/ZeRO-2 HCU preset; disk caches require explicit opt-in.
 defaults:
   - performance
   - _self_
+
+checkpoint_skip_layers: 24  # Native 30-layer model: checkpoint the first 6.
+deferred_gather: true
+
+# Both one-stage online encoding and two-stage cached training use this preset.
+# Constant/scheduler caching stays enabled through the performance preset.
+text_cache: false
+offline_text_cache: false
+text_cache_dir: null
+vae_latent_cache: false
+vae_latent_cache_dir: null
 
 compile:
   threads: 1
