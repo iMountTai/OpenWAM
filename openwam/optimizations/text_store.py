@@ -1,8 +1,11 @@
 """Offline frozen T5 contexts, generated alongside the RoboTwin VAE store.
 
-OPENWAM_OPT_TEXT_CACHE selects this store when OPENWAM_TEXT_CACHE_DIR is set,
-or when OPENWAM_VAE_LATENT_CACHE_DIR is set (its ``text`` subdirectory). Without
-either directory, the original bounded online text cache remains available.
+Generation writes to OPENWAM_TEXT_CACHE_DIR, or else to the ``text``
+subdirectory of OPENWAM_VAE_LATENT_CACHE_DIR. Training with
+OPENWAM_OPT_TEXT_CACHE reads this store when OPENWAM_TEXT_CACHE_DIR is set, or
+when OPENWAM_OPT_VAE_LATENT_CACHE is enabled with its directory. A latent
+directory left in the environment of a run without the latent cache does not
+select it; the original bounded online text cache remains available.
 Only valid token rows are saved, independently of TEXT_TRIM; readers restore
 zero padding to the batch maximum or the full 512-token length. Version 1
 stores must be removed and regenerated before using this format.
@@ -42,7 +45,12 @@ def directory():
 
 
 def requested():
-    return enabled("OPENWAM_OPT_TEXT_CACHE") and directory() is not None
+    """Whether training reads the offline store instead of encoding with T5."""
+    if not enabled("OPENWAM_OPT_TEXT_CACHE"):
+        return False
+    if os.environ.get("OPENWAM_TEXT_CACHE_DIR", "").strip():
+        return True
+    return enabled("OPENWAM_OPT_VAE_LATENT_CACHE") and directory() is not None
 
 
 def training_prompts(dataset):

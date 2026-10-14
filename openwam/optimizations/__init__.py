@@ -33,6 +33,7 @@ SWITCHES = (
     "OPENWAM_OPT_VAE_LATENT_CACHE",
     "OPENWAM_OPT_FUSED_ADAMW",
     "OPENWAM_OPT_HOST_ASYNC",
+    "OPENWAM_OPT_DEFERRED_GATHER",
 )
 
 
@@ -107,6 +108,8 @@ def configure_zero(config: dict) -> None:
         if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
             zero.update(reduce_scatter=True, contiguous_gradients=True, use_multi_rank_bucket_allreduce=True,
                         overlap_comm=True)
+    if enabled("OPENWAM_OPT_DEFERRED_GATHER") and config["zero_optimization"].get("stage") != 2:
+        raise ValueError("OPENWAM_OPT_DEFERRED_GATHER currently requires ZeRO-2")
     if enabled("OPENWAM_OPT_ZERO_OVERLAP"):
         zero = config["zero_optimization"]
         zero.update(overlap_comm=True, contiguous_gradients=True)

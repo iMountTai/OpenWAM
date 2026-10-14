@@ -450,7 +450,12 @@ class DualSystemMoTDriver:
                 bool(use_gradient_checkpointing and self.ab.training),
             )
             self._reported_checkpoint_count = checkpoint_count
+        from openwam.optimizations import deferred_gather
+
         for layer_id in range(self.num_layers):
+            if deferred_gather.PENDING is not None:
+                # OPENWAM_OPT_DEFERRED_GATHER: this layer's parameters may still be in flight.
+                deferred_gather.PENDING.wait_layer(layer_id)
             vstate, astate = self.step(
                 layer_id,
                 vstate,
@@ -460,6 +465,8 @@ class DualSystemMoTDriver:
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 **({"suppress_inner_attn_ckpt": True} if partial and layer_id >= checkpoint_count else {}),
             )
+        if deferred_gather.PENDING is not None:
+            deferred_gather.PENDING.finish()
         return vstate, astate
 
 

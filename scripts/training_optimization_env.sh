@@ -17,13 +17,13 @@ _openwam_set_optimization_env() {
         POINTWISE_COMPILE ROPE_REAL ZERO_OVERLAP LIGHTOP_NORM
         VAE_POINTWISE_COMPILE GLOBAL_COMPILE
         PARTIAL_CHECKPOINT UINT8_PREPROCESS T5_PREFIX TEXT_TRIM LINEAR_BIAS2D
-        SAC_FA SAC_FFN_FULL SAC_GEMM ZERO_REDUCE_SCATTER ONLINE_ENCODE
+        SAC_FA SAC_FFN_FULL SAC_GEMM ZERO_REDUCE_SCATTER ONLINE_ENCODE DEFERRED_GATHER
         FA2_MASK_FUSED PADDING_PLAN_CPU
     )
     # Validate before changing the environment.
     for group in "$@"; do
         case "$group" in
-            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|lightop_norm|vae_pointwise|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d|sac_fa|sac_ffn_full|sac_gemm|zero_reduce_scatter|online_encode|fa2_mask_fused|padding_plan_cpu) ;;
+            baseline|constants|text_cache|vae_layout|fa2_padding|mot_attention|pointwise|rope_real|zero_overlap|lightop_norm|vae_pointwise|global_compile|partial_checkpoint|uint8_preprocess|t5_prefix|text_trim|linear_bias2d|sac_fa|sac_ffn_full|sac_gemm|zero_reduce_scatter|online_encode|deferred_gather|fa2_mask_fused|padding_plan_cpu) ;;
             partial_checkpoint=*|sac_ffn_full=*)
                 if [[ ! "${group#*=}" =~ ^[0-9]+$ ]]; then
                     echo "Layer count must be a non-negative integer: $group" >&2; return 2
@@ -47,6 +47,7 @@ _openwam_set_optimization_env() {
             vae_layout) export OPENWAM_OPT_VAE_CHANNELS_LAST=1 ;;
             zero_reduce_scatter) export OPENWAM_OPT_ZERO_REDUCE_SCATTER=1 ;;
             online_encode) export OPENWAM_OPT_ONLINE_ENCODE=1 ;;
+            deferred_gather) export OPENWAM_OPT_DEFERRED_GATHER=1 ;;
             fa2_padding) export OPENWAM_OPT_FA2_PADDING=1 ;;
             fa2_mask_fused) export OPENWAM_OPT_FA2_MASK_FUSED=1 ;;
             padding_plan_cpu) export OPENWAM_OPT_PADDING_PLAN_CPU=1 ;;

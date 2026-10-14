@@ -422,6 +422,15 @@ class OpenWAMTrainer:
         prof_context = self._build_profiler(output_path)
         from openwam.optimizations import enabled
 
+        deferred = None
+        if enabled("OPENWAM_OPT_DEFERRED_GATHER"):
+            from openwam.optimizations.deferred_gather import DeferredGather
+
+            # With ONLINE_ENCODE the encoder's gather replacement launches it.
+            deferred = DeferredGather(
+                self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
+                patch_step=not enabled("OPENWAM_OPT_ONLINE_ENCODE"),
+            )
         online = None
         if enabled("OPENWAM_OPT_ONLINE_ENCODE"):
             from openwam.optimizations.online_encode import OnlineEncoder
@@ -429,6 +438,7 @@ class OpenWAMTrainer:
             online = OnlineEncoder(
                 self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
                 num_workers=dataloader.num_workers, gradient_accumulation_steps=grad_accum,
+                deferred=deferred,
             )
         gc_trace = None
         if enabled("OPENWAM_TRACE_GC"):
@@ -453,6 +463,7 @@ class OpenWAMTrainer:
                     report(info, metrics)
 
         with (prof_context as prof,
+              deferred if deferred is not None else contextlib.nullcontext(),
               online if online is not None else contextlib.nullcontext(),
               gc_trace if gc_trace is not None else contextlib.nullcontext()):
             epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
@@ -524,6 +535,8 @@ class OpenWAMTrainer:
                     # save_steps: write the weights line (+ the resumable full state when
                     # save_full_states_for_resume=true), then prune in lockstep.
                     if save_steps and global_step > 0 and global_step % save_steps == 0:
+                        if deferred is not None:
+                            deferred.finish()
                         save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
                         if save_full_states_for_resume:
                             save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
@@ -761,8 +774,11 @@ class OpenWAMTrainer:
             from openwam.optimizations.sac import begin_step
 
             begin_step(self.accelerator.device)
+        from openwam.optimizations import deferred_gather
         from openwam.optimizations.online_encode import PreparedInputs
 
+        # OPENWAM_OPT_DEFERRED_GATHER: non-layer parameters may still be in flight.
+        deferred_gather.wait_prologue()
         if isinstance(batch, PreparedInputs):
             inputs = batch.values
         else:
@@ -882,6 +898,9 @@ class OpenWAMTrainer:
         removes every ``accel_state_step_*`` and retains the configured number of recent
         weight checkpoints (rank-0, post-barrier).
         """
+        from openwam.optimizations import deferred_gather
+
+        deferred_gather.finish()
         if save_steps:
             save_weights(self.accelerator, self.architecture, output_path, global_step, final=True)
         self.accelerator.wait_for_everyone()

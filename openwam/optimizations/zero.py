@@ -14,6 +14,7 @@ A device allocation inside the backward hook can block the host for seconds
 near the memory limit and stall every rank.
 """
 
+import functools
 import inspect
 import logging
 import types
@@ -187,6 +188,28 @@ def validate_zero(optimizer):
         raise ValueError("Online optimizations do not support ZenFlow or sequence parallelism")
     if any(group is not optimizer.dp_process_group for group in optimizer.real_dp_process_group):
         raise ValueError("Online optimizations require one data-parallel process group")
+
+
+def step_with_gather(optimizer, gather):
+    """A bound copy of optimizer.step whose step-end all_gather_dp_groups is ``gather``.
+
+    Only this instance's step sees the replacement; DeepSpeed's module globals
+    and other callers (update_lp_params, checkpoint loading) are unchanged.
+    """
+    function = optimizer.step.__func__
+    if "all_gather_dp_groups" not in function.__code__.co_names:
+        raise RuntimeError("Unsupported DeepSpeed step: no direct all_gather_dp_groups call")
+    expected = ("groups_flat", "partitioned_param_groups", "dp_process_group",
+                "start_alignment_factor", "allgather_bucket_size")
+    if tuple(inspect.signature(function.__globals__["all_gather_dp_groups"]).parameters) != expected:
+        raise RuntimeError("Unsupported DeepSpeed AllGather interface")
+    namespace = dict(function.__globals__)
+    namespace["all_gather_dp_groups"] = gather
+    replacement = types.FunctionType(function.__code__, namespace, function.__name__,
+                                     function.__defaults__, function.__closure__)
+    replacement.__kwdefaults__ = function.__kwdefaults__
+    functools.update_wrapper(replacement, function)
+    return types.MethodType(replacement, optimizer)
 
 
 def install_reduce_scatter(optimizer):

@@ -213,6 +213,10 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
 
             if self.training and active():
                 raise ValueError("Complete SAC requires the joint video/action training path")
+            from openwam.optimizations import deferred_gather
+
+            # Only the joint loop waits per layer for OPENWAM_OPT_DEFERRED_GATHER.
+            deferred_gather.finish()
             for block_id in range(vb.num_layers):
                 vstate = vb.run_block(block_id, vstate)
             return vb.finalize(vstate), None
@@ -231,6 +235,9 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         )
         compiled_loop = getattr(self, "_compiled_mot_run_joint_loop", None)
         if compiled_loop is not None and not use_gradient_checkpointing and not use_gradient_checkpointing_offload:
+            from openwam.optimizations import deferred_gather
+
+            deferred_gather.finish()  # The compiled loop does not wait per layer.
             try:
                 vstate, astate = compiled_loop(vstate, astate)
             except Exception as exc:
