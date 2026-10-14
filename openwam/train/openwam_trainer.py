@@ -354,8 +354,6 @@ class OpenWAMTrainer:
         is_main = self.accelerator is None or self.accelerator.is_main_process
         wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
 
-        from tqdm import tqdm
-
         if num_epochs is not None:
             total_steps = len(dataloader) * num_epochs
             if max_steps:
@@ -411,7 +409,6 @@ class OpenWAMTrainer:
             text_store.attach(self.dataset, arch.video_backbone)
 
         _step_t0 = _time.monotonic()
-        pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
         assert self.accelerator is not None, "OpenWAMTrainer requires an Accelerator"
 
@@ -453,7 +450,7 @@ class OpenWAMTrainer:
 
         def report(info, metrics):
             self.log_step(
-                metrics=metrics, **info, batch_size=batch_size, pbar=pbar, wandb_run=wandb_run,
+                metrics=metrics, **info, batch_size=batch_size, total_steps=total_steps, wandb_run=wandb_run,
                 debug=debug, output_path=output_path,
             )
 
@@ -545,12 +542,10 @@ class OpenWAMTrainer:
 
                     if max_steps and global_step >= max_steps:
                         flush_metrics()
-                        pbar.close()
                         self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                         return
 
             flush_metrics()
-            pbar.close()
             self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
 
     # (3) Called by train() first — AdamW over the per-module (action/video) LR param groups.
@@ -800,7 +795,7 @@ class OpenWAMTrainer:
             "action": result.get("loss_action", torch.tensor(0.0)),
         }
 
-    # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.
+    # (10) Called each step in train()'s loop — rank-0 console/WandB log, debug loss-history CSV.
     def log_step(
         self,
         *,
@@ -811,65 +806,56 @@ class OpenWAMTrainer:
         lr,
         steps_per_sec,
         batch_size,
-        pbar,
+        total_steps,
         wandb_run,
         debug,
         output_path,
     ) -> None:
-        """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
+        """Print one rank-0 line per reported step, log to WandB, and retain debug CSV output."""
         from openwam.optimizations import enabled
 
         if enabled("OPENWAM_CHECKPOINT_STATS"):
             from openwam.optimizations.sac import report_step
 
             report_step(global_step, self.accelerator.device, metrics, steps_per_sec, batch_size, opt_step)
+        # Metrics are already reduced by every rank before entering this method.
+        # Gate only output; no collective or training work belongs behind this check.
+        is_main = self.accelerator is None or self.accelerator.is_main_process
+        if not is_main:
+            return
         labels = [("action", "loss_action")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
 
-        if pbar is not None:
-            postfix = {"loss": f"{loss_total:.4f}", "video": f"{loss_video:.4f}"}
-            for name, key in labels:
-                postfix[name] = f"{metrics[key]:.4f}"
-            postfix["lr"] = f"{lr:.2e}"
-            postfix["epoch"] = epoch
-            pbar.set_postfix(postfix)
-            pbar.update(1)
+        num_procs = self.accelerator.num_processes if self.accelerator is not None else 1
+        samples_per_sec = steps_per_sec * batch_size * num_procs
+        loss_parts = " ".join(f"{name}={metrics[key]:.6f}" for name, key in labels)
+        tag = "debug" if debug else "train"
+        msg = (
+            f"[{tag}][step {global_step:04d}/{total_steps:04d} opt {opt_step:04d}] "
+            f"loss={loss_total:.6f} video={loss_video:.6f} {loss_parts} "
+            f"grad_norm={grad_norm:.6f} lr={lr:.3e} epoch={epoch} "
+            f"s/step={1.0 / max(steps_per_sec, 1e-9):.4f} samples/s={samples_per_sec:.3f}"
+        )
+        # Like parameter counts, print directly so Hydra's logging filter cannot
+        # hide progress. Plain newlines also remain readable through tee.
+        print(msg, flush=True)
 
         if wandb_run is not None:
-            num_procs = self.accelerator.num_processes if self.accelerator is not None else 1
             log_dict = {
                 "train/loss": loss_total,
                 "train/loss_video": loss_video,
                 "train/grad_norm": grad_norm,
                 "train/lr": lr,
                 "performance/steps_per_sec": steps_per_sec,
-                "performance/samples_per_sec": steps_per_sec * batch_size * num_procs,
+                "performance/samples_per_sec": samples_per_sec,
             }
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
             wandb_run.log(log_dict, step=global_step)
 
-        if not debug:
-            return
-        is_main = self.accelerator is None or self.accelerator.is_main_process
-        if not is_main:
-            return
-        loss_parts = " ".join(f"{name}={metrics[key]:.6f}" for name, key in labels)
-        msg = (
-            f"[debug][step {global_step:04d} opt {opt_step:04d}] "
-            f"loss={loss_total:.6f} video={loss_video:.6f} {loss_parts} "
-            f"grad_norm={grad_norm:.6f} lr={lr:.3e} epoch={epoch} "
-            f"steps_per_sec={steps_per_sec:.3f}"
-        )
-        logger.info(msg)
-        if pbar is not None:
-            pbar.write(msg)
-        else:
-            print(msg, flush=True)
-
-        if output_path:
+        if debug and output_path:
             write_debug_loss_row(
                 output_path,
                 labels=labels,
