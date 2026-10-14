@@ -50,6 +50,7 @@ dtk:
 profiling:
   ranks: 'off'  # off / rank0 / all
   light: false
+  active_steps: 1  # Consecutive profiled steps; use 2 to capture a cross-step gather.
 
 diagnostics:
   checkpoint_stats: false

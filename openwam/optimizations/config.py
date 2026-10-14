@@ -41,6 +41,7 @@ class DTKSettings:
 class ProfilingSettings:
     ranks: str = "off"  # off / rank0 / all
     light: bool = False
+    active_steps: int = 1
 
 
 @dataclass(frozen=True)
@@ -108,11 +109,13 @@ def configure(config=None) -> OptimizationSettings:
 
     writable(schema)
     candidate = OmegaConf.to_object(OmegaConf.merge(schema, {} if config is None else config))
-    for path in ("checkpoint_skip_layers", "sac.layers", "compile.threads", "dtk.hw_queues", "text_cache_size"):
+    for path in ("checkpoint_skip_layers", "sac.layers", "compile.threads", "dtk.hw_queues", "text_cache_size",
+                 "profiling.active_steps"):
         value = candidate
         for name in path.split("."):
             value = getattr(value, name)
-        minimum = 2 if path == "dtk.hw_queues" else (1 if path in {"compile.threads", "text_cache_size"} else 0)
+        minimum = 2 if path == "dtk.hw_queues" else (
+            1 if path in {"compile.threads", "text_cache_size", "profiling.active_steps"} else 0)
         if value is not None and value < minimum:
             raise ValueError(f"optimizations.{path} must be >= {minimum}, got {value}")
     if candidate.profiling.ranks not in {"off", "rank0", "all"}:

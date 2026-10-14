@@ -64,11 +64,11 @@ def build_profiler(output_path, rank):
         logger.info("[PROFILER] Rank %d exported %s in %.2fs", rank, trace_path, time.monotonic() - started)
 
     wait, warmup = (14, 1) if config.light else (15, 0)
-    logger.info("[PROFILER] rank=%d wait=%d warmup=%d active=1 with_stack=%s record_shapes=%s traces=%s",
-                rank, wait, warmup, not config.light, not config.light, trace_dir)
+    logger.info("[PROFILER] rank=%d wait=%d warmup=%d active=%d with_stack=%s record_shapes=%s traces=%s",
+                rank, wait, warmup, config.active_steps, not config.light, not config.light, trace_dir)
     return torch.profiler.profile(
         activities=activities,
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=1, repeat=1),
+        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=config.active_steps, repeat=1),
         on_trace_ready=trace_handler,
         record_shapes=not config.light,
         profile_memory=False,
