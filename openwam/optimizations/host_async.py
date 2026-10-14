@@ -44,22 +44,49 @@ class LaggedMetrics:
     def __init__(self, accelerator):
         self.accelerator = accelerator
         self.pending = None
+        self.stream = None
 
     def push(self, losses, grad_norm, info):
+        from openwam.optimizations import deferred_gather
+
         device = losses["total"].device
         values = torch.stack([
             device_scalar(value, device).reshape(())
             for value in (losses["total"], losses["video"], losses["action"], grad_norm)
         ])
-        if self.accelerator is not None and self.accelerator.num_processes > 1:
-            values = self.accelerator.gather(values.reshape(1, -1)).mean(dim=0)
         host = torch.empty(values.shape, dtype=values.dtype, pin_memory=True)
-        host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
-        event.record()
+        if (deferred_gather.PENDING is not None and self.accelerator is not None
+                and self.accelerator.num_processes > 1):
+            self._gather_aside(values, host, event)
+        else:
+            if self.accelerator is not None and self.accelerator.num_processes > 1:
+                values = self.accelerator.gather(values.reshape(1, -1)).mean(dim=0)
+            host.copy_(values, non_blocking=True)
+            event.record()
         ready = self.flush()
         self.pending = (event, host, info)
         return ready
+
+    def _gather_aside(self, values, host, event):
+        """Gather on a side stream while deferred-gather broadcasts are in flight.
+
+        Ranks are no longer aligned by a step-end AllGather, so this small
+        collective can take as long as the rank skew; the training stream would
+        otherwise wait for it before the next forward. Same values and mean as
+        accelerator.gather over the default group.
+        """
+        import torch.distributed as dist
+
+        if self.stream is None:
+            self.stream = torch.cuda.Stream(device=values.device)
+        gathered = torch.empty((dist.get_world_size(), values.numel()), dtype=values.dtype, device=values.device)
+        work = dist.all_gather_into_tensor(gathered, values, async_op=True)
+        with torch.cuda.stream(self.stream):
+            work.wait()
+            host.copy_(gathered.mean(dim=0), non_blocking=True)
+            event.record(self.stream)
+        gathered.record_stream(self.stream)
 
     def flush(self):
         if self.pending is None:

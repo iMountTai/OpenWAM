@@ -68,6 +68,7 @@ class OptimizationSettings:
     text_trim: bool = False
     zero_reduce_scatter: bool = False
     online_encode: bool = False
+    deferred_gather: bool = False
     fused_adamw: bool = False
     host_async: bool = False
     vae_latent_cache: bool = False

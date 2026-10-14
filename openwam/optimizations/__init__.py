@@ -32,6 +32,7 @@ SWITCHES = (
     "sac.gemm",
     "zero_reduce_scatter",
     "online_encode",
+    "deferred_gather",
     "dtk.hw_queues",
     "fused_adamw",
     "host_async",
@@ -95,10 +96,10 @@ def configure_zero(config: dict) -> None:
         from openwam.optimizations.host_async import configure_deepspeed
 
         configure_deepspeed(config)
-    if enabled("zero_reduce_scatter") or enabled("online_encode"):
+    if any(enabled(name) for name in ("zero_reduce_scatter", "online_encode", "deferred_gather")):
         zero = config["zero_optimization"]
         if zero.get("stage") != 2:
-            raise ValueError("ReduceScatter and online encoding currently require ZeRO-2")
+            raise ValueError("ReduceScatter, online encoding and deferred gather currently require ZeRO-2")
         if enabled("zero_reduce_scatter"):
             zero.update(reduce_scatter=True, contiguous_gradients=True, use_multi_rank_bucket_allreduce=True,
                         overlap_comm=True)
@@ -208,7 +209,7 @@ def mot_driver_type():
     config = settings()
     active = (config.compile.mot or config.mot_split_attn or config.checkpoint_skip_layers > 0
               or any((config.sac.attention, config.sac.ffn_full, config.sac.gemm, bool(config.sac.extra_ops)))
-              or config.diagnostics.checkpoint_stats)
+              or config.diagnostics.checkpoint_stats or config.deferred_gather)
     if active:
         from openwam.optimizations.mot import OptimizationMoTDriver
 

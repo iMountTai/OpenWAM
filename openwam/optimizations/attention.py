@@ -119,9 +119,18 @@ def cpu_context_mask(inputs, *, append_proprio=False, sample_mask=None):
             if extra.shape != (batch, 1):
                 return None
         keep = torch.cat([keep, extra], dim=1)
-    plan = tuple(value.to(context.device) for value in _build_padding_plan(keep))
-    # Own storage even for CPU execution; no alias to user-mutable CPU masks.
-    mask = keep.to(device=context.device, copy=True).contiguous()
+    from openwam.optimizations.host_async import active as host_async_active
+    from openwam.optimizations.host_async import upload
+
+    if host_async_active() and context.device.type == "cuda":
+        # Pageable uploads wait for all queued work, stalling the host at the
+        # start of the forward. Pinned copies are fresh, so no alias remains.
+        plan = tuple(upload(value, context.device) for value in _build_padding_plan(keep))
+        mask = upload(keep, context.device).contiguous()
+    else:
+        plan = tuple(value.to(context.device) for value in _build_padding_plan(keep))
+        # Own storage even for CPU execution; no alias to user-mutable CPU masks.
+        mask = keep.to(device=context.device, copy=True).contiguous()
     root, signature = _padding_signature(mask, mask)
     _remember_padding(root, signature, plan)
     return mask

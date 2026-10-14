@@ -102,6 +102,8 @@ def _finished(path, rows):
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "configs"), config_name="train")
 def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
+    from omegaconf import OmegaConf
+
     from openwam.dataloader.registry import build_dataset
     from openwam.model.video_backbone.wan import encode as wan_encode
     from openwam.optimizations import configure_backends, create_trainer, enabled, prepare_runtime_constants, text_store
@@ -109,8 +111,6 @@ def main(cfg: DictConfig) -> None:
 
     # This command always generates from pixels, including when a training
     # preset enables cached-latent reads. Never skip VAE preparation here.
-    from omegaconf import OmegaConf
-
     OmegaConf.update(cfg, "optimizations.vae_latent_cache", False)
     configure_backends(cfg.get("optimizations"))
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -196,7 +196,8 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError(f"Unfinished episodes after encoding: {sorted(rows)}")
     logger.info("[latent store] rank %d finished %d windows in %.0f s", rank, done, time.monotonic() - started)
     if enabled("offline_text_cache"):
-        text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
+        shard = text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
+        text_store.finalize_distributed_index(shard)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from openwam.train.utils.training_utils import (
     cfg_get,
     init_wandb,
     reduce_step_metrics,
+    write_debug_loss_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,9 @@ class OptimizationTrainer(NativeTrainer):
         return result
 
     def compute_loss(self, batch):
+        from openwam.optimizations import deferred_gather
+
+        deferred_gather.wait_prologue()
         if enabled("diagnostics.checkpoint_stats"):
             from openwam.optimizations.sac import begin_step
 
@@ -99,13 +103,76 @@ class OptimizationTrainer(NativeTrainer):
                 }
         return super().compute_loss(batch)
 
-    def log_step(self, **kwargs):
+    def log_step(
+        self,
+        *,
+        metrics,
+        global_step,
+        opt_step,
+        epoch,
+        lr,
+        steps_per_sec,
+        batch_size,
+        total_steps,
+        wandb_run,
+        debug,
+        output_path,
+    ) -> None:
+        """Print one rank-0 line per reported step, log to WandB, and retain debug CSV output."""
+        from openwam.optimizations import enabled
+
         if enabled("diagnostics.checkpoint_stats"):
             from openwam.optimizations.sac import report_step
 
-            report_step(kwargs["global_step"], self.accelerator.device, kwargs["metrics"],
-                        kwargs["steps_per_sec"], kwargs["batch_size"], kwargs["opt_step"])
-        return super().log_step(**kwargs)
+            report_step(global_step, self.accelerator.device, metrics, steps_per_sec, batch_size, opt_step)
+        # Metrics are already reduced by every rank before entering this method.
+        # Gate only output; no collective or training work belongs behind this check.
+        is_main = self.accelerator is None or self.accelerator.is_main_process
+        if not is_main:
+            return
+        labels = [("action", "loss_action")]
+        loss_total = metrics["loss_total"]
+        loss_video = metrics["loss_video"]
+        grad_norm = metrics["grad_norm"]
+
+        num_procs = self.accelerator.num_processes if self.accelerator is not None else 1
+        samples_per_sec = steps_per_sec * batch_size * num_procs
+        loss_parts = " ".join(f"{name}={metrics[key]:.6f}" for name, key in labels)
+        tag = "debug" if debug else "train"
+        msg = (
+            f"[{tag}][step {global_step:04d}/{total_steps:04d} opt {opt_step:04d}] "
+            f"loss={loss_total:.6f} video={loss_video:.6f} {loss_parts} "
+            f"grad_norm={grad_norm:.6f} lr={lr:.3e} epoch={epoch} "
+            f"s/step={1.0 / max(steps_per_sec, 1e-9):.4f} samples/s={samples_per_sec:.3f}"
+        )
+        # Like parameter counts, print directly so Hydra's logging filter cannot
+        # hide progress. Plain newlines also remain readable through tee.
+        print(msg, flush=True)
+
+        if wandb_run is not None:
+            log_dict = {
+                "train/loss": loss_total,
+                "train/loss_video": loss_video,
+                "train/grad_norm": grad_norm,
+                "train/lr": lr,
+                "performance/steps_per_sec": steps_per_sec,
+                "performance/samples_per_sec": samples_per_sec,
+            }
+            for name, key in labels:
+                log_dict[f"train/loss_{name}"] = metrics[key]
+            wandb_run.log(log_dict, step=global_step)
+
+        if debug and output_path:
+            write_debug_loss_row(
+                output_path,
+                labels=labels,
+                metrics=metrics,
+                global_step=global_step,
+                opt_step=opt_step,
+                epoch=epoch,
+                lr=lr,
+                steps_per_sec=steps_per_sec,
+            )
 
     def train(self, num_epochs: int = None, max_steps: int = None):
         """Run the training loop (HuggingFace Accelerate distributed).
@@ -187,8 +254,6 @@ class OptimizationTrainer(NativeTrainer):
         is_main = self.accelerator is None or self.accelerator.is_main_process
         wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
 
-        from tqdm import tqdm
-
         if num_epochs is not None:
             total_steps = len(dataloader) * num_epochs
             if max_steps:
@@ -224,8 +289,26 @@ class OptimizationTrainer(NativeTrainer):
                     skip_first,
                 )
 
+        from openwam.optimizations import enabled
+
+        if enabled("vae_latent_cache"):
+            from openwam.optimizations.latent_cache import attach, vae_fingerprint, validate_backbone
+
+            # After finetune/resume weights are in place and before DataLoader
+            # workers fork (they start at the first iteration).
+            arch = self.accelerator.unwrap_model(self.architecture)
+            validate_backbone(arch)
+            attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
+
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            # Resume has restored weights by this point. Never serve a cache
+            # fingerprinted against the pre-resume encoder.
+            arch = self.accelerator.unwrap_model(self.architecture)
+            text_store.attach(self.dataset, arch.video_backbone)
+
         _step_t0 = _time.monotonic()
-        pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=min(global_step, total_steps))
 
         assert self.accelerator is not None, "OpenWAMTrainer requires an Accelerator"
 
@@ -236,6 +319,15 @@ class OptimizationTrainer(NativeTrainer):
         prof_context = self._build_profiler(output_path)
         from openwam.optimizations import enabled
 
+        deferred = None
+        if enabled("deferred_gather"):
+            from openwam.optimizations.deferred_gather import DeferredGather
+
+            # With ONLINE_ENCODE the encoder's gather replacement launches it.
+            deferred = DeferredGather(
+                self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
+                patch_step=not enabled("online_encode"),
+            )
         online = None
         if enabled("online_encode"):
             from openwam.optimizations.online_encode import OnlineEncoder
@@ -243,27 +335,13 @@ class OptimizationTrainer(NativeTrainer):
             online = OnlineEncoder(
                 self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
                 num_workers=dataloader.num_workers, gradient_accumulation_steps=grad_accum,
+                deferred=deferred,
             )
         gc_trace = None
         if enabled("diagnostics.trace_gc"):
             from openwam.optimizations.gc_trace import GCTrace
 
             gc_trace = GCTrace(output_path, self._rank)
-        if enabled("vae_latent_cache"):
-            from openwam.optimizations.latent_cache import attach, vae_fingerprint, validate_backbone
-
-            # After finetune/resume weights are in place and before DataLoader
-            # workers fork (they start at the first iteration).
-            arch = self.accelerator.unwrap_model(self.architecture)
-            validate_backbone(arch)
-            attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
-        from openwam.optimizations import text_store
-
-        if text_store.requested():
-            # Resume has restored weights; validate before workers start and
-            # before any lookahead encoding can read an offline context.
-            arch = self.accelerator.unwrap_model(self.architecture)
-            text_store.attach(self.dataset, arch.video_backbone)
         lagged = None
         if enabled("host_async"):
             from openwam.optimizations.host_async import LaggedMetrics, device_scalar
@@ -272,7 +350,7 @@ class OptimizationTrainer(NativeTrainer):
 
         def report(info, metrics):
             self.log_step(
-                metrics=metrics, **info, batch_size=batch_size, pbar=pbar, wandb_run=wandb_run,
+                metrics=metrics, **info, batch_size=batch_size, total_steps=total_steps, wandb_run=wandb_run,
                 debug=debug, output_path=output_path,
             )
 
@@ -282,6 +360,7 @@ class OptimizationTrainer(NativeTrainer):
                     report(info, metrics)
 
         with (prof_context as prof,
+              deferred if deferred is not None else contextlib.nullcontext(),
               online if online is not None else contextlib.nullcontext(),
               gc_trace if gc_trace is not None else contextlib.nullcontext()):
             epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
@@ -312,6 +391,8 @@ class OptimizationTrainer(NativeTrainer):
                         loss = losses["total"]
                         self.accelerator.backward(loss)
 
+                        # DeepSpeed may already have queued step-end AllGather
+                        # inside backward. A host scalar upload would wait for it.
                         grad_norm = (
                             torch.zeros((), device=loss.device, dtype=torch.float32)
                             if lagged is not None else torch.tensor(0.0, device=loss.device)
@@ -351,6 +432,8 @@ class OptimizationTrainer(NativeTrainer):
                     # save_steps: write the weights line (+ the resumable full state when
                     # save_full_states_for_resume=true), then prune in lockstep.
                     if save_steps and global_step > 0 and global_step % save_steps == 0:
+                        if deferred is not None:
+                            deferred.finish()
                         save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
                         if save_full_states_for_resume:
                             save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
@@ -359,10 +442,14 @@ class OptimizationTrainer(NativeTrainer):
 
                     if max_steps and global_step >= max_steps:
                         flush_metrics()
-                        pbar.close()
                         self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
                         return
 
             flush_metrics()
-            pbar.close()
             self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
+
+    def finish_training(self, *args, **kwargs):
+        from openwam.optimizations import deferred_gather
+
+        deferred_gather.finish()
+        return super().finish_training(*args, **kwargs)

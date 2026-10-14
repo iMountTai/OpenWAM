@@ -30,7 +30,7 @@ class OnlineEncoder:
     one allocator pool and needs no events or record_stream.
     """
 
-    def __init__(self, architecture, optimizer, *, num_workers, gradient_accumulation_steps):
+    def __init__(self, architecture, optimizer, *, num_workers, gradient_accumulation_steps, deferred=None):
         from openwam.optimizations.text import _native_t5, frozen_eval
 
         validate_zero(optimizer)
@@ -50,6 +50,7 @@ class OnlineEncoder:
         # and timesteps remain in compute_loss after the per-step seed.
         self.architecture = architecture
         self.optimizer = optimizer
+        self.deferred = deferred
         self.pending = None
         self.next_batch = None
         self.original_step = optimizer.step
@@ -81,6 +82,17 @@ class OnlineEncoder:
 
     def _gather(self, groups_flat, partitioned_param_groups, dp_process_group,
                 start_alignment_factor, allgather_bucket_size):
+        if self.deferred is not None:
+            # optimizations.deferred_gather: launch the owner broadcasts and encode
+            # behind them; the next forward waits per layer, not this step.
+            self.deferred.gather(groups_flat, partitioned_param_groups, dp_process_group)
+            if self.next_batch is not None:
+                take, self.next_batch = self.next_batch, None
+                batch = take()
+                with torch.no_grad():
+                    values = self.architecture.prepare_inputs(batch if isinstance(batch, list) else [batch])
+                self.pending = PreparedInputs(values)
+            return
         if self.next_batch is None:
             return self.original_gather(groups_flat, partitioned_param_groups, dp_process_group,
                                         start_alignment_factor, allgather_bucket_size)

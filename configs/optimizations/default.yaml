@@ -16,6 +16,7 @@ t5_prefix: false
 text_trim: false
 zero_reduce_scatter: false
 online_encode: false
+deferred_gather: false  # Wait for updated ZeRO-2 parameters per MoT layer in the next forward.
 fused_adamw: false
 host_async: false  # Drop per-step host syncs; step metrics are logged one step late.
 vae_latent_cache: false  # Read latents written by scripts/cache_vae_latents.py.
