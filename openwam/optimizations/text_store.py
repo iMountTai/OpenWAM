@@ -3,7 +3,9 @@
 OPENWAM_OPT_TEXT_CACHE selects this store when OPENWAM_TEXT_CACHE_DIR is set,
 or when OPENWAM_VAE_LATENT_CACHE_DIR is set (its ``text`` subdirectory). Without
 either directory, the original bounded online text cache remains available.
-Full 512-token contexts and true lengths are saved independently of TEXT_TRIM.
+Only valid token rows are saved, independently of TEXT_TRIM; readers restore
+zero padding to the batch maximum or the full 512-token length. Version 1
+stores must be removed and regenerated before using this format.
 """
 
 import hashlib
@@ -21,7 +23,7 @@ from openwam.optimizations.text import _native_t5, frozen_eval
 
 logger = logging.getLogger(__name__)
 FULL_LENGTH = 512
-VERSION = 1
+VERSION = 2
 DTYPES = {"bfloat16": (torch.bfloat16, np.dtype("int16")),
           "float16": (torch.float16, np.dtype("float16")),
           "float32": (torch.float32, np.dtype("float32"))}
@@ -126,7 +128,13 @@ def _path(root, prompt):
     return os.path.join(root, key[:2], key + ".npy")
 
 
+def _validate_version(root, meta):
+    if meta.get("version") != VERSION:
+        raise ValueError(f"Unsupported T5 text cache version: remove the text cache and rerun step 1 ({root})")
+
+
 def _entry(root, prompt, meta):
+    _validate_version(root, meta)
     path = _path(root, prompt)
     with open(path + ".json", encoding="utf-8") as handle:
         record = json.load(handle)
@@ -134,7 +142,7 @@ def _entry(root, prompt, meta):
     if (record.get("prompt") != prompt or type(length) is not int or not 0 <= length <= FULL_LENGTH):
         raise ValueError(f"Invalid T5 text cache entry: {path}")
     array = np.load(path, mmap_mode="r", allow_pickle=False)
-    if array.shape != (FULL_LENGTH, meta["dim"]) or array.dtype != DTYPES[meta["dtype"]][1]:
+    if array.shape != (length, meta["dim"]) or array.dtype != DTYPES[meta["dtype"]][1]:
         raise ValueError(f"T5 text cache shape/dtype mismatch: {path}")
     return length, array
 
@@ -158,8 +166,10 @@ def generate(dataset, backbone, *, device, batch_size, rank=0, world=1):
     meta_path = os.path.join(root, "meta.json")
     if os.path.isfile(meta_path):
         with open(meta_path, encoding="utf-8") as handle:
-            if json.load(handle).get("signature") != meta:
-                raise ValueError(f"T5 text cache settings/weights differ: use a new directory ({root})")
+            existing = json.load(handle).get("signature", {})
+        _validate_version(root, existing)
+        if existing != meta:
+            raise ValueError(f"T5 text cache settings/weights differ: use a new directory ({root})")
     else:
         _json(meta_path, {"signature": meta, "generation": {"t5_prefix": enabled("OPENWAM_OPT_T5_PREFIX")}})
     prompts = training_prompts(dataset)
@@ -182,6 +192,7 @@ def generate(dataset, backbone, *, device, batch_size, rank=0, world=1):
                 raise ValueError(f"Unexpected T5 output shape: {context.shape}")
             for prompt, value, length in zip(batch, context, lengths):
                 path = _path(root, prompt)
+                value = value[:length].contiguous()
                 array = value.view(torch.int16).numpy() if value.dtype == torch.bfloat16 else value.numpy()
                 _atomic(path, lambda handle, array=array: np.save(handle, array, allow_pickle=False))
                 # Written last: an interrupted tensor write is never a complete entry.
@@ -218,7 +229,7 @@ class PromptContexts:
             while len(self.maps) > 64:
                 self.maps.popitem(last=False)
             length = self.lengths[prompt]
-            value = torch.from_numpy(np.array(array[:length], copy=True))
+            value = torch.from_numpy(np.array(array, copy=True))
             context[index, :length].copy_(value.view(torch.bfloat16) if dtype == torch.bfloat16 else value)
         # Lengths intentionally stay on CPU, as in the padding-plan path.
         return context.to(device=target, non_blocking=True), lengths
@@ -240,6 +251,7 @@ def attach(dataset, backbone):
         raise FileNotFoundError(f"T5 text cache has no meta.json; run step 1 with OPENWAM_OPT_TEXT_CACHE=True ({root})")
     with open(path, encoding="utf-8") as handle:
         meta = json.load(handle)["signature"]
+    _validate_version(root, meta)
     if meta != signature(backbone):
         raise ValueError(f"T5 text cache weights/tokenizer/settings mismatch ({root})")
     prompts = training_prompts(dataset)
