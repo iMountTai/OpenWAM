@@ -15,6 +15,9 @@ OPENWAM_OPT_VAE_LATENT_CACHE=1 and the same OPENWAM_VAE_LATENT_CACHE_DIR.
 With OPENWAM_OPT_TEXT_CACHE=1, also encode all possible training prompts with
 the frozen T5. OPENWAM_TEXT_CACHE_DIR defaults to the latent directory's
 ``text`` subdirectory. Step 2 uses the same flag/directory and keeps T5 on CPU.
+Rerunning with complete v2 text files builds ``text/index.json`` without T5
+encoding. Rank lengths are gathered on CPU and the complete index is published
+atomically, so training need not scan the individual text files at startup.
 """
 
 import json
@@ -193,7 +196,8 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError(f"Unfinished episodes after encoding: {sorted(rows)}")
     logger.info("[latent store] rank %d finished %d windows in %.0f s", rank, done, time.monotonic() - started)
     if enabled("OPENWAM_OPT_TEXT_CACHE"):
-        text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
+        shard = text_store.generate(dataset, backbone, device=device, batch_size=batch_size, rank=rank, world=world)
+        text_store.finalize_distributed_index(shard)
 
 
 if __name__ == "__main__":
