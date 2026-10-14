@@ -1,0 +1,6 @@
+# Opt-in pins for an existing DTK environment; do not use the CUDA lock here.
+# The public DeepSpeed pin accepts installed 0.18.4 local builds (e.g. +dtk).
+# For exact runtime preservation, install OpenWAM with --no-deps; version pins
+# alone cannot distinguish a patched wheel that shares the upstream version.
+numpy==1.25.0
+deepspeed==0.18.4

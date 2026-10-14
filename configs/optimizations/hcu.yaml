@@ -3,7 +3,11 @@ defaults:
   - performance
   - _self_
 
-checkpoint_skip_layers: 24  # Native 30-layer model: checkpoint the first 6.
+# Same knob as main's PARTIAL_CHECKPOINT; CLI overrides remain independent.
+# Online training: skip the last 12 of 30 layers (checkpoint the first 18).
+# With both VAE/T5 disk caches enabled, a larger tail can be tried as memory
+# permits, e.g. optimizations.checkpoint_skip_layers=24. Keep 12 without caches.
+checkpoint_skip_layers: 12
 deferred_gather: true
 
 # Both one-stage online encoding and two-stage cached training use this preset.
