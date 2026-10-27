@@ -1,3 +1,27 @@
+__all__ = [
+    "FLAGS",
+    "active",
+    "active_ffn_boundary",
+    "attention_boundary",
+    "begin_step",
+    "context_fn",
+    "dispatcher",
+    "extras_enabled",
+    "ffn_boundary",
+    "layer_range",
+    "layers",
+    "prepare",
+    "projection_boundary",
+    "report_step",
+    "run_attention",
+    "run_ffn",
+    "run_norm",
+    "run_pointwise",
+    "run_projection",
+    "run_video_projection",
+    "validate",
+]
+
 """Standard PyTorch SAC policies for complete FFNs, attention and other ops.
 
 Each checkpoint owns its standard forward/recompute modes. Only explicit eager
@@ -73,6 +97,10 @@ def active():
 
 def ffn_boundary():
     return enabled("OPENWAM_OPT_SAC_FFN_FULL") or enabled("OPENWAM_OPT_SAC_GEMM") or extras_enabled()
+
+
+def active_ffn_boundary() -> bool:
+    return _session.get() is not None and ffn_boundary()
 
 
 def attention_boundary():
@@ -255,6 +283,8 @@ def native_mot_expression():
 
 def _invoke(region, fn, *args, **kwargs):
     mode = _session.get()
+    if mode is None and region not in {"projection", "norm", "pointwise"} and not extras_enabled():
+        return fn(*args, **kwargs)
     # Norms moved out of GLOBAL keep the same native expression/backend choice.
     scope = os.environ.get("OPENWAM_GLOBAL_COMPILE_SCOPE", "all").strip().lower()
     native = enabled("OPENWAM_OPT_GLOBAL_COMPILE") and scope in {"mot", "all"}
@@ -299,7 +329,9 @@ def _call(region, fn, *args, **kwargs):
 
 @dispatcher
 def run_attention(fn, *args, label="attention", **kwargs):
-    if not attention_boundary():
+    if not attention_boundary() or (
+        _session.get() is None and not torch.compiler.is_compiling() and not extras_enabled()
+    ):
         return fn(*args, **kwargs)
     return _call(label, fn, *args, **kwargs)
 

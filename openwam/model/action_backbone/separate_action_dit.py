@@ -50,7 +50,7 @@ from openwam.model.action_backbone.components import (
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 from openwam.optimizations import enabled, pointwise
 from openwam.optimizations.attention import fa2_padding
-from openwam.optimizations.sac import extras_enabled, ffn_boundary, run_attention, run_ffn, run_norm, run_projection
+from openwam.optimizations.sac import active_ffn_boundary, extras_enabled, ffn_boundary, run_attention, run_ffn, run_norm, run_projection
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
@@ -885,7 +885,8 @@ class ActionDiT(ActionDiTBackbone):
                     )
             x = x + block.cross_attn(run_norm(block.context_attn_norm, x), payload.context, ctx_mask=text_mask)
         mlp_input = _modulate(run_norm(block.ffn_norm, x), shift_mlp, scale_mlp)
-        mlp_output = run_ffn(block.ffn, mlp_input) if ffn_boundary() else block.ffn(mlp_input)
+        use_ffn_boundary = active_ffn_boundary() or (ffn_boundary() and torch.compiler.is_compiling())
+        mlp_output = run_ffn(block.ffn, mlp_input) if use_ffn_boundary else block.ffn(mlp_input)
         x = block.gate(x, gate_mlp, mlp_output)
 
         payload.x_action = x

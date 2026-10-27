@@ -71,6 +71,8 @@ def _padding_plan(mask, keep):
 def _build_padding_plan(keep):
     lengths = keep.sum(dim=-1, dtype=torch.int32)
     nonempty = lengths > 0
+    if keep.device.type == "cpu":
+        nonempty._openwam_all_true = bool(nonempty.all())
     # FA2 builds differ in support for zero-length K. Give empty rows a dummy
     # first key, then zero their result (and gradients), matching SDPA semantics.
     positions = torch.arange(keep.shape[1], device=keep.device)
@@ -122,15 +124,18 @@ def cpu_context_mask(inputs, *, append_proprio=False, sample_mask=None):
     from openwam.optimizations.host_async import active as host_async_active
     from openwam.optimizations.host_async import upload
 
+    raw_plan = _build_padding_plan(keep)
     if host_async_active() and context.device.type == "cuda":
         # Pageable uploads wait for all queued work, stalling the host at the
         # start of the forward. Pinned copies are fresh, so no alias remains.
-        plan = tuple(upload(value, context.device) for value in _build_padding_plan(keep))
+        plan = tuple(upload(value, context.device) for value in raw_plan)
         mask = upload(keep, context.device).contiguous()
     else:
-        plan = tuple(value.to(context.device) for value in _build_padding_plan(keep))
+        plan = tuple(value.to(context.device) for value in raw_plan)
         # Own storage even for CPU execution; no alias to user-mutable CPU masks.
         mask = keep.to(device=context.device, copy=True).contiguous()
+    if hasattr(raw_plan[2], "_openwam_all_true"):
+        plan[2]._openwam_all_true = raw_plan[2]._openwam_all_true
     root, signature = _padding_signature(mask, mask)
     _remember_padding(root, signature, plan)
     return mask
@@ -148,6 +153,10 @@ def _compiled_nonempty():
 
 
 def _mask_nonempty(out, nonempty):
+    from openwam.optimizations.sac import extras_enabled
+
+    if getattr(nonempty, "_openwam_all_true", False) and not extras_enabled():
+        return out
     if enabled("OPENWAM_OPT_FA2_MASK_FUSED"):
         return _compiled_nonempty()(out, nonempty)
     return out.masked_fill((~nonempty).view(-1, 1, 1), 0)

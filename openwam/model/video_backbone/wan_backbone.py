@@ -583,14 +583,14 @@ class WanBase(VideoBackbone):
         context_mask = None
         if state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
-        from openwam.optimizations.sac import ffn_boundary, run_ffn as run_complete_ffn, run_norm
+        from openwam.optimizations.sac import active_ffn_boundary, ffn_boundary, run_ffn as run_complete_ffn, run_norm
 
         hidden_states = hidden_states + block.cross_attn(
             run_norm(block.norm3, hidden_states), state.context, ctx_mask=context_mask,
             **cross_attention_kwargs(block.cross_attn),
         )
         mlp_input = modulate(run_norm(block.norm2, hidden_states), shift_mlp, scale_mlp)
-        if ffn_boundary():
+        if active_ffn_boundary() or (ffn_boundary() and torch.compiler.is_compiling()):
             mlp_output = run_complete_ffn(block.ffn, mlp_input, video=True)
         else:
             mlp_output = video_ffn(block.ffn, mlp_input)

@@ -121,6 +121,7 @@ class DeferredGather:
         if dist.get_world_size(dp_group) > 1:
             self.pieces = plan(self.flats, optimizer.bit16_groups, optimizer.parallel_partitioned_bit16_groups,
                                stages, self.tail)
+        self.piece_views = [self.flats[piece.group].narrow(0, piece.start, piece.length) for piece in self.pieces]
         self.sources = [dist.get_global_rank(dp_group, owner) for owner in range(dist.get_world_size(dp_group))]
         # Every rank must create the group, in the same order as other groups.
         self.group = dist.new_group(ranks=dist.get_process_group_ranks(dp_group))
@@ -166,10 +167,11 @@ class DeferredGather:
             raise RuntimeError("ZeRO flat buffers changed after the deferred gather plan was built")
         # Each collective first waits for the optimizer update already queued
         # on the current stream, then runs on the group's communication stream.
+        if getattr(self, "piece_views", None) is None:
+            self.piece_views = [self.flats[piece.group].narrow(0, piece.start, piece.length) for piece in self.pieces]
         self.works = [
-            dist.broadcast(self.flats[piece.group].narrow(0, piece.start, piece.length),
-                           src=self.sources[piece.owner], group=self.group, async_op=True)
-            for piece in self.pieces
+            dist.broadcast(view, src=self.sources[piece.owner], group=self.group, async_op=True)
+            for piece, view in zip(self.pieces, self.piece_views)
         ]
         self.next = 0
         if self.works:

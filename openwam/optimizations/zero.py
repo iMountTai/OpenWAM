@@ -114,31 +114,40 @@ def reduce_by_owner(tensors, owners, *, group, dtype, divide=False, max_elements
             if not lengths[owner]:
                 continue
             dst = dist.get_global_rank(group, owner) if group is not None else owner
-            if all(view.dtype == dtype for view in views):
-                # In place per contiguous range, like DeepSpeed's allreduce path:
-                # no staging copy and no chunking. Callers merge adjacent ranges.
-                for view in views:
-                    if not view.numel():
-                        continue
-                    if divide:
-                        view.div_(world)
-                    work = dist.reduce(view, dst=dst, group=group, async_op=True)
-                    work.wait()
+            if len(views) == 1 and views[0].dtype == dtype:
+                view = views[0]
+                if not view.numel():
+                    continue
+                if divide:
+                    view.div_(world)
+                work = dist.reduce(view, dst=dst, group=group, async_op=True)
+                work.wait()
                 continue
             for start in range(0, lengths[owner], max_elements):
                 count = min(max_elements, lengths[owner] - start)
                 pieces = _pieces(views, start, count)
                 packed = _staging_buffer(device, dtype, max_elements).narrow(0, 0, count)
-                offset = 0
-                for piece in pieces:
-                    packed.narrow(0, offset, piece.numel()).copy_(piece)
-                    offset += piece.numel()
+                if all(piece.dtype == dtype for piece in pieces):
+                    dst_views = []
+                    offset = 0
+                    for piece in pieces:
+                        dst_views.append(packed.narrow(0, offset, piece.numel()))
+                        offset += piece.numel()
+                    torch._foreach_copy_(dst_views, pieces)
+                else:
+                    offset = 0
+                    for piece in pieces:
+                        packed.narrow(0, offset, piece.numel()).copy_(piece)
+                        offset += piece.numel()
                 if divide:
                     packed.div_(world)
                 work = dist.reduce(packed, dst=dst, group=group, async_op=True)
                 work.wait()
                 if owner == rank:
-                    _copy_from_flat(pieces, packed)
+                    if all(piece.dtype == dtype for piece in pieces):
+                        torch._foreach_copy_(pieces, dst_views)
+                    else:
+                        _copy_from_flat(pieces, packed)
 
 
 def _average_tensor(self, tensor, communication_data_type):
@@ -146,29 +155,38 @@ def _average_tensor(self, tensor, communication_data_type):
     stream = self.reduction_stream
     stream.wait_stream(producer)
     bucket = self.ipg_buckets[communication_data_type]
-    ranges = []  # (start, length, owner); adjacent ranges of one owner merged.
-    cursor = 0
-    for group_id, param_index, param_id in bucket.params:
-        param = self.bit16_groups[group_id][param_index]
-        # DeepSpeed may store integral partition offsets as floats. Normalize
-        # before arithmetic so both narrow's start and length remain integers.
-        partitions = sorted(
-            (int(self.grad_start_offset[group_id][owner][param_id]), owner)
-            for owner in self.param_to_partition_ids[group_id][param_id]
-        )
-        for index, (offset, owner) in enumerate(partitions):
-            stop = partitions[index + 1][0] if index + 1 < len(partitions) else param.numel()
-            start, length = cursor + offset, stop - offset
-            if ranges and ranges[-1][2] == owner and ranges[-1][0] + ranges[-1][1] == start:
-                ranges[-1] = (ranges[-1][0], ranges[-1][1] + length, owner)
-            else:
-                ranges.append((start, length, owner))
-        cursor += param.numel()
-    if cursor != tensor.numel():
-        raise RuntimeError("ZeRO bucket mapping does not cover the reduction tensor")
+    cache = getattr(self, "_openwam_bucket_plan_cache", None)
+    if cache is None:
+        cache = self._openwam_bucket_plan_cache = {}
+    cache_key = (tuple(bucket.params), int(tensor.numel()), int(self.nccl_start_alignment_factor))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        ranges, owners = cached
+    else:
+        ranges = []  # (start, length, owner); adjacent ranges of one owner merged.
+        cursor = 0
+        for group_id, param_index, param_id in bucket.params:
+            param = self.bit16_groups[group_id][param_index]
+            # DeepSpeed may store integral partition offsets as floats. Normalize
+            # before arithmetic so both narrow's start and length remain integers.
+            partitions = sorted(
+                (int(self.grad_start_offset[group_id][owner][param_id]), owner)
+                for owner in self.param_to_partition_ids[group_id][param_id]
+            )
+            for index, (offset, owner) in enumerate(partitions):
+                stop = partitions[index + 1][0] if index + 1 < len(partitions) else param.numel()
+                start, length = cursor + offset, stop - offset
+                if ranges and ranges[-1][2] == owner and ranges[-1][0] + ranges[-1][1] == start:
+                    ranges[-1] = (ranges[-1][0], ranges[-1][1] + length, owner)
+                else:
+                    ranges.append((start, length, owner))
+            cursor += param.numel()
+        if cursor != tensor.numel():
+            raise RuntimeError("ZeRO bucket mapping does not cover the reduction tensor")
+        owners = [owner for _, _, owner in ranges]
+        cache[cache_key] = (ranges, owners)
     # One view per contiguous owner range lets a skewed bucket reduce in place.
     views = [tensor.narrow(0, start, length) for start, length, _ in ranges]
-    owners = [owner for _, _, owner in ranges]
     with torch.cuda.stream(stream):
         tensor.record_stream(stream)
         # Preserve DeepSpeed's existing pre-reduction rounding/scaling order.
@@ -231,11 +249,28 @@ def install_reduce_scatter(optimizer):
     accumulate = optimizer.reduce_independent_p_g_buckets_and_remove_grads
     events = {}
 
+    orig_copy_grads = optimizer.copy_grads_in_partition
+    orig_get_grad_norm_direct = optimizer.get_grad_norm_direct
+    orig_update_model_weights = optimizer._update_model_bit16_weights
+    pending_dsts = []
+    pending_srcs = []
+    in_reduce_ipg = False
+
     def reduce_ipg(this, comm_dtype=None):
+        nonlocal in_reduce_ipg
         # Capture indices before DeepSpeed clears each bucket's metadata.
         keys = [(dtype, bucket.index) for dtype, bucket in this.ipg_buckets.items()
                 if (comm_dtype is None or dtype == comm_dtype) and bucket.elements]
-        result = reduced(comm_dtype=comm_dtype)
+        in_reduce_ipg = True
+        try:
+            result = reduced(comm_dtype=comm_dtype)
+            if pending_dsts:
+                with torch.cuda.stream(this.reduction_stream):
+                    torch._foreach_copy_(pending_dsts, pending_srcs)
+        finally:
+            in_reduce_ipg = False
+            pending_dsts.clear()
+            pending_srcs.clear()
         for key in keys:
             event = torch.cuda.Event()
             event.record(this.reduction_stream)  # Includes copy_grads_in_partition.
@@ -253,6 +288,74 @@ def install_reduce_scatter(optimizer):
                 torch.cuda.current_stream().wait_event(event)
         return accumulate(param, i)
 
+    def copy_grads(this, param):
+        if not in_reduce_ipg or this.cpu_offload or this.grads_in_partition is None:
+            return orig_copy_grads(param)
+        grad_reduc = this.get_gradient_for_reduction(param)
+        numel = param.numel()
+        offset = this.grads_in_partition_offset
+        this.grads_in_partition_offset = offset + numel
+        dst_view = this.grads_in_partition.view(-1).narrow(0, offset, numel).view_as(grad_reduc)
+        pending_dsts.append(dst_view)
+        pending_srcs.append(grad_reduc.view_as(grad_reduc))
+        grad_reduc.data = dst_view
+
+    def get_grad_norm(this, gradients, params, norm_type=2):
+        norm_type = float(norm_type)
+        if norm_type != 2.0 or getattr(this, "cpu_offload", False):
+            return orig_get_grad_norm_direct(gradients, params, norm_type)
+        from deepspeed.runtime.zero.stage_1_and_2 import is_model_parallel_parameter
+
+        mp_rank_zero = (this.model_parallel_rank == 0)
+        grads_for_norm = []
+        for g, p in zip(gradients, params):
+            if g is None:
+                continue
+            if getattr(p, "ds_pipe_replicated", False) or getattr(p, "pipe_replicated", False):
+                continue
+            if mp_rank_zero or is_model_parallel_parameter(p):
+                grads_for_norm.append(g.data.detach())
+        if not grads_for_norm:
+            total_norm = torch.zeros((), dtype=torch.float32, device=this.device)
+        else:
+            try:
+                norms = torch._foreach_norm(grads_for_norm, 2.0, dtype=torch.float64)
+                total_norm = torch.stack(norms).square().sum().float()
+            except Exception:
+                return orig_get_grad_norm_direct(gradients, params, norm_type)
+        dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=this.dp_process_group)
+        if hasattr(this, "_model_parallel_all_reduce"):
+            this._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
+        total_norm = total_norm.pow(1.0 / norm_type)
+        total_norm.masked_fill_(torch.isinf(total_norm) | torch.isnan(total_norm), -1.0)
+        return total_norm
+
+    def update_model_weights(this, group_index):
+        flat = this.bit16_groups_flat[group_index]
+        params = this.bit16_groups[group_index]
+        if params:
+            flat_storage_ptr = flat.untyped_storage().data_ptr()
+            valid_cache = getattr(this, "_openwam_bit16_views_valid", None)
+            if valid_cache is None:
+                valid_cache = this._openwam_bit16_views_valid = {}
+            key = (group_index, flat_storage_ptr, len(params))
+            is_valid = valid_cache.get(key)
+            if is_valid is None:
+                is_valid = all(
+                    p.data.untyped_storage().data_ptr() == flat_storage_ptr and p.data.is_contiguous()
+                    for p in params
+                )
+                valid_cache[key] = is_valid
+            elif params[0].data.untyped_storage().data_ptr() != flat_storage_ptr:
+                is_valid = False
+                valid_cache[key] = False
+            if is_valid:
+                return
+        orig_update_model_weights(group_index)
+
+    optimizer.copy_grads_in_partition = types.MethodType(copy_grads, optimizer)
+    optimizer.get_grad_norm_direct = types.MethodType(get_grad_norm, optimizer)
+    optimizer._update_model_bit16_weights = types.MethodType(update_model_weights, optimizer)
     optimizer.average_tensor = types.MethodType(_average_tensor, optimizer)
     optimizer.reduce_ipg_grads = types.MethodType(reduce_ipg, optimizer)
     optimizer.reduce_independent_p_g_buckets_and_remove_grads = types.MethodType(accumulate_grad, optimizer)

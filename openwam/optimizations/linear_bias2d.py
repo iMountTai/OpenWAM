@@ -4,24 +4,43 @@ Keep modules and Parameters in place. Hooks, custom forwards, compilation and
 metadata outside the reference production case retain the original calls.
 """
 
+from functools import lru_cache
+
 import torch
 from torch import nn
 
 from openwam.optimizations import enabled
-from openwam.optimizations.sac import dispatcher
+from openwam.optimizations.sac import dispatcher, projection_boundary, run_video_projection
+
+_HIP_TORCH_271 = (torch.version.hip is not None and torch.__version__.split("+")[0] == "2.7.1")
+_CUBLAS_BACKEND = getattr(getattr(torch.backends.cuda, "BlasBackend", None), "Cublas", None)
 
 
-def _has_hooks(module):
-    return any(getattr(module, name, None) for name in (
-        "_forward_pre_hooks", "_forward_hooks", "_backward_pre_hooks", "_backward_hooks",
-    ))
+@lru_cache(maxsize=16)
+def _is_gfx936(device: torch.device) -> bool:
+    try:
+        arch = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", "UNKNOWN")).split(":")[0]
+        return arch == "gfx936"
+    except Exception:
+        return False
 
 
-def _global_hooks():
-    return any(getattr(nn.modules.module, name, None) for name in (
-        "_global_forward_pre_hooks", "_global_forward_hooks",
-        "_global_backward_pre_hooks", "_global_backward_hooks",
-    ))
+def _has_hooks(module: nn.Module) -> bool:
+    return bool(
+        getattr(module, "_forward_pre_hooks", None)
+        or getattr(module, "_forward_hooks", None)
+        or getattr(module, "_backward_pre_hooks", None)
+        or getattr(module, "_backward_hooks", None)
+    )
+
+
+def _global_hooks() -> bool:
+    return bool(
+        getattr(nn.modules.module, "_global_forward_pre_hooks", None)
+        or getattr(nn.modules.module, "_global_forward_hooks", None)
+        or getattr(nn.modules.module, "_global_backward_pre_hooks", None)
+        or getattr(nn.modules.module, "_global_backward_hooks", None)
+    )
 
 
 def _native(module, kind):
@@ -39,7 +58,7 @@ def can_use_bias2d(linear, x):
     if (type(x) is not torch.Tensor or type(weight) is not nn.Parameter or type(bias) is not nn.Parameter
             or not x.is_cuda or not weight.is_cuda or not bias.is_cuda
             or x.device != weight.device or x.device != bias.device
-            or torch.version.hip is None or torch.__version__.split("+")[0] != "2.7.1"
+            or not _HIP_TORCH_271
             or x.dtype != torch.bfloat16 or weight.dtype != x.dtype or bias.dtype != x.dtype
             or torch.is_autocast_enabled(x.device.type)
             or not x.requires_grad or not weight.requires_grad or not bias.requires_grad
@@ -49,16 +68,13 @@ def can_use_bias2d(linear, x):
             or not x.is_contiguous() or not weight.is_contiguous() or not bias.is_contiguous()):
         return False
     # Inspect the measured backend; never change the process-wide preference.
-    if str(torch.backends.cuda.preferred_blas_library()) != "_BlasBackend.Cublas":
+    if torch.backends.cuda.preferred_blas_library() != _CUBLAS_BACKEND:
         return False
-    arch = str(getattr(torch.cuda.get_device_properties(x.device), "gcnArchName", "UNKNOWN")).split(":")[0]
-    return arch == "gfx936"
+    return _is_gfx936(x.device)
 
 
 @dispatcher
 def video_linear(linear, x):
-    from openwam.optimizations.sac import projection_boundary, run_video_projection
-
     if projection_boundary():
         return run_video_projection(linear, x)
     return _video_linear(linear, x)
