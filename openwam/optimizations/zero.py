@@ -243,6 +243,12 @@ def _average_tensor(self, tensor, communication_data_type):
     views = [tensor.narrow(0, start, length) for start, length, _ in ranges]
     with torch.cuda.stream(stream):
         tensor.record_stream(stream)
+        fused = getattr(self, "_openwam_scaled_pack", None)
+        if fused is not None and fused.run(
+            tensor, ranges, group=self.dp_process_group, dtype=communication_data_type,
+            max_elements=_PACK_ELEMENTS, staging_buffer=_staging_buffer,
+        ):
+            return
         # Preserve DeepSpeed's existing pre-reduction rounding/scaling order.
         tensor.div_(dist.get_world_size(self.dp_process_group))
         reduce_by_owner(views, owners, group=self.dp_process_group, dtype=communication_data_type)
@@ -306,6 +312,21 @@ def install_reduce_scatter(optimizer):
     orig_copy_grads = optimizer.copy_grads_in_partition
     orig_get_grad_norm_direct = optimizer.get_grad_norm_direct
     orig_update_model_weights = optimizer._update_model_bit16_weights
+    from openwam.optimizations import enabled
+
+    if enabled("OPENWAM_OPT_ZERO_SCALED_PACK"):
+        from openwam.optimizations.zero_fused import ScaledPack
+
+        optimizer._openwam_scaled_pack = ScaledPack()
+        logger.info("[optimizations] sparse-owner BF16 scaled pack/unpack enabled")
+    norm_overlap = None
+    if enabled("OPENWAM_OPT_ZERO_NORM_OVERLAP"):
+        from openwam.optimizations.zero_norm import NormOverlap
+
+        norm_overlap = NormOverlap(optimizer)
+        norm_overlap.install()
+        optimizer._openwam_norm_overlap = norm_overlap
+        logger.info("[optimizations] final accumulated partition norm preparation on side stream enabled")
     pending_dsts = []
     pending_srcs = []
     in_reduce_ipg = False
@@ -382,25 +403,19 @@ def install_reduce_scatter(optimizer):
         norm_type = float(norm_type)
         if norm_type != 2.0 or getattr(this, "cpu_offload", False):
             return orig_get_grad_norm_direct(gradients, params, norm_type)
-        from deepspeed.runtime.zero.stage_1_and_2 import is_model_parallel_parameter
+        total_norm = norm_overlap.take(gradients, params) if norm_overlap is not None else None
+        if total_norm is None:
+            from openwam.optimizations.zero_norm import selected_gradients
 
-        mp_rank_zero = (this.model_parallel_rank == 0)
-        grads_for_norm = []
-        for g, p in zip(gradients, params):
-            if g is None:
-                continue
-            if getattr(p, "ds_pipe_replicated", False) or getattr(p, "pipe_replicated", False):
-                continue
-            if mp_rank_zero or is_model_parallel_parameter(p):
-                grads_for_norm.append(g.data.detach())
-        if not grads_for_norm:
-            total_norm = torch.zeros((), dtype=torch.float32, device=this.device)
-        else:
-            try:
-                norms = torch._foreach_norm(grads_for_norm, 2.0, dtype=torch.float64)
-                total_norm = torch.stack(norms).square().sum().float()
-            except Exception:
-                return orig_get_grad_norm_direct(gradients, params, norm_type)
+            grads_for_norm = selected_gradients(this, gradients, params)
+            if not grads_for_norm:
+                total_norm = torch.zeros((), dtype=torch.float32, device=this.device)
+            else:
+                try:
+                    norms = torch._foreach_norm(grads_for_norm, 2.0, dtype=torch.float64)
+                    total_norm = torch.stack(norms).square().sum().float()
+                except Exception:
+                    return orig_get_grad_norm_direct(gradients, params, norm_type)
         dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=this.dp_process_group)
         if hasattr(this, "_model_parallel_all_reduce"):
             this._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)

@@ -28,6 +28,8 @@ SWITCHES = (
     "OPENWAM_OPT_SAC_FFN_FULL",
     "OPENWAM_OPT_SAC_GEMM",
     "OPENWAM_OPT_ZERO_REDUCE_SCATTER",
+    "OPENWAM_OPT_ZERO_SCALED_PACK",
+    "OPENWAM_OPT_ZERO_NORM_OVERLAP",
     "OPENWAM_OPT_ONLINE_ENCODE",
     "OPENWAM_OPT_HW_QUEUES",
     "OPENWAM_OPT_VAE_LATENT_CACHE",
@@ -97,6 +99,9 @@ def configure_backends() -> None:
 
 
 def configure_zero(config: dict) -> None:
+    if (enabled("OPENWAM_OPT_ZERO_SCALED_PACK") or enabled("OPENWAM_OPT_ZERO_NORM_OVERLAP")):
+        if not enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
+            raise ValueError("ZeRO scaled pack/norm overlap require OPENWAM_OPT_ZERO_REDUCE_SCATTER=1")
     if enabled("OPENWAM_OPT_HOST_ASYNC"):
         from openwam.optimizations.host_async import configure_deepspeed
 
