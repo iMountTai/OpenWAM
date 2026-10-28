@@ -14,6 +14,7 @@ A device allocation inside the backward hook can block the host for seconds
 near the memory limit and stall every rank.
 """
 
+import contextlib
 import functools
 import inspect
 import logging
@@ -25,6 +26,59 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 _PACK_ELEMENTS = 64 * 1024 * 1024  # Total packed elements, across all ranks.
 _staging = {}
+
+
+class _BucketCopies:
+    """Bound source lifetimes while coalescing producer-stream bucket copies."""
+
+    def __init__(self, max_bytes=64 * 1024 * 1024, max_tensors=32):
+        self.max_bytes = max_bytes
+        self.max_tensors = max_tensors
+        self.dsts, self.srcs = [], []
+        self.bytes = 0
+        self.stream = None
+
+    def append(self, dst, src):
+        stream = torch.cuda.current_stream(src.device) if src.is_cuda else None
+        # A small view can pin a much larger original gradient allocation.
+        # Conservatively count its storage, even if two views share it.
+        size = src.untyped_storage().nbytes()
+        if self.srcs and (stream != self.stream or self.bytes + size > self.max_bytes):
+            self.flush()
+        # A large gradient cannot share the bounded batch. Avoid retaining it
+        # and avoid replacing one DMA copy with many foreach kernels.
+        if size >= self.max_bytes:
+            dst.copy_(src)
+            return
+        self.stream = stream
+        self.dsts.append(dst)
+        # This view retains the original storage across grad_reduc.data rebinding.
+        self.srcs.append(src.detach())
+        self.bytes += size
+        if len(self.srcs) >= self.max_tensors or self.bytes >= self.max_bytes:
+            self.flush()
+
+    def flush(self):
+        if not self.srcs:
+            return
+        stream = self.stream
+        try:
+            with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                if len(self.srcs) == 1:
+                    self.dsts[0].copy_(self.srcs[0])
+                else:
+                    torch._foreach_copy_(self.dsts, self.srcs)
+            if stream is not None:
+                current = torch.cuda.current_stream(stream.device)
+                if current != stream:
+                    # A later average_tensor waits on its current producer;
+                    # include a batch queued on an earlier producer stream.
+                    current.wait_stream(stream)
+        finally:
+            self.dsts.clear()
+            self.srcs.clear()
+            self.bytes = 0
+            self.stream = None
 
 
 def _staging_buffer(device, dtype, numel):
@@ -246,8 +300,8 @@ def install_reduce_scatter(optimizer):
         if tuple(inspect.signature(getattr(optimizer, name)).parameters) != parameters:
             raise RuntimeError(f"Unsupported DeepSpeed interface: {name}")
     reduced = optimizer.reduce_ipg_grads
-    accumulate = optimizer.reduce_independent_p_g_buckets_and_remove_grads
     events = {}
+    bucket_copies = {}
 
     orig_copy_grads = optimizer.copy_grads_in_partition
     orig_get_grad_norm_direct = optimizer.get_grad_norm_direct
@@ -258,6 +312,10 @@ def install_reduce_scatter(optimizer):
 
     def reduce_ipg(this, comm_dtype=None):
         nonlocal in_reduce_ipg
+        # Flush before DeepSpeed/average_tensor records the producer dependency.
+        for dtype, copies in bucket_copies.items():
+            if comm_dtype is None or dtype == comm_dtype:
+                copies.flush()
         # Capture indices before DeepSpeed clears each bucket's metadata.
         keys = [(dtype, bucket.index) for dtype, bucket in this.ipg_buckets.items()
                 if (comm_dtype is None or dtype == comm_dtype) and bucket.elements]
@@ -280,13 +338,33 @@ def install_reduce_scatter(optimizer):
     def accumulate_grad(this, param, i):
         dtype = this.get_param_comm_dtype(param)
         bucket = this.ipg_buckets[dtype]
-        if bucket.elements + param.numel() > this.reduce_bucket_size:
+        numel = param.numel()
+        if bucket.elements + numel > this.reduce_bucket_size:
+            this.reduce_ipg_grads(comm_dtype=dtype)
             # Wait only when the *other* double-buffer is about to be reused.
             # Compute does not wait here for the bucket being reduced right now.
             event = events.get((dtype, 1 - bucket.index))
             if event is not None:
                 torch.cuda.current_stream().wait_event(event)
-        return accumulate(param, i)
+            bucket.index = 1 - bucket.index
+        if not getattr(param, "ds_grad_is_ready", True):
+            return
+        param_id = this.get_param_id(param)
+        if this.params_already_reduced[param_id]:
+            raise RuntimeError(f"Gradient for parameter {param_id} was reduced twice in one step")
+        grad = this.get_gradient_for_reduction(param)
+        if numel > this.reduce_bucket_size:
+            this.extra_large_param_to_reduce[dtype] = param
+        else:
+            dst = bucket.buffer[bucket.index].narrow(0, bucket.elements, numel)
+            copies = bucket_copies.get(dtype)
+            if copies is None:
+                copies = bucket_copies[dtype] = _BucketCopies()
+            copies.append(dst, grad.reshape(-1))
+            grad.data = dst.view_as(grad)
+        bucket.elements += numel
+        bucket.grads.append(grad)
+        bucket.params.append((i, param.param_idx_in_group, param_id))
 
     def copy_grads(this, param):
         if not in_reduce_ipg or this.cpu_offload or this.grads_in_partition is None:

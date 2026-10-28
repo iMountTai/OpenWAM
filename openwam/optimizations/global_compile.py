@@ -2,16 +2,17 @@
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from einops import rearrange
 from torch import Tensor
 
-from openwam.optimizations import enabled
-from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
-from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply
 from openwam.model.action_backbone.separate_action_dit import _modulate, rope_apply_1d
+from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply
+from openwam.optimizations import enabled
+from openwam.optimizations.attention import separate_attention_plan, split_attention_separate
+from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
 from openwam.optimizations.sac import (
     active_ffn_boundary,
     dispatcher,
@@ -74,6 +75,7 @@ def _stage1_pre_attn(
     a_t_mod: Tensor,
     a_freqs: Tensor,
     a_num_heads: int,
+    separate_qkv: bool = False,
 ):
     has_seq = v_time_mod.dim() == 4
     chunk_dim = 2 if has_seq else 1
@@ -110,20 +112,31 @@ def _stage1_pre_attn(
     q_a = rearrange(q_a, "b n s d -> b s (n d)", n=a_num_heads)
     k_a = rearrange(k_a, "b n s d -> b s (n d)", n=a_num_heads)
 
-    q_cat = torch.cat([q_v, q_a], dim=1)
-    k_cat = torch.cat([k_v, k_a], dim=1)
-    v_cat = torch.cat([v_v, v_a], dim=1)
+    if separate_qkv:
+        # Keep one packed K/V allocation, just as in the original path. Returning
+        # raw video K/V as well as an eager joint cat pins two extra video-sized
+        # buffers per layer for attention backward (about 2 GiB over 30 layers).
+        attention_inputs = (q_v, torch.cat([k_v, k_a], dim=1), torch.cat([v_v, v_a], dim=1),
+                            q_a, None, None)
+    else:
+        attention_inputs = (torch.cat([q_v, q_a], dim=1), torch.cat([k_v, k_a], dim=1),
+                            torch.cat([v_v, v_a], dim=1), None, None, None)
     return (
-        q_cat, k_cat, v_cat,
+        *attention_inputs,
         v_gate_msa, v_shift_mlp, v_scale_mlp, v_gate_mlp,
         a_gate_msa, a_shift_mlp, a_scale_mlp, a_gate_mlp,
     )
 
 
+def _stage2_joint_pre_cross_attn(mixed, s_video, s_action, *args):
+    # Keep splitting inside the compiled graph on the original attention path.
+    attn_v, attn_a = mixed.split([s_video, s_action], dim=1)
+    return _stage2_pre_cross_attn(attn_v, attn_a, *args)
+
+
 def _stage2_pre_cross_attn(
-    mixed: Tensor,
-    s_video: int,
-    s_action: int,
+    attn_v: Tensor,
+    attn_a: Tensor,
     video_block,
     action_block,
     v_residual_x: Tensor,
@@ -136,8 +149,6 @@ def _stage2_pre_cross_attn(
     a_context_mask: Optional[Tensor],
     linear_bias2d: bool,
 ):
-    # Split mixed self-attention
-    attn_v, attn_a = mixed.split([s_video, s_action], dim=1)
     attn_v = attn_v.contiguous()
     attn_a = attn_a.contiguous()
 
@@ -267,6 +278,7 @@ def compile_mot_layer(driver):
 
     compiled_stage1 = torch.compile(_stage1_pre_attn, dynamic=False, options=_options())
     compiled_stage2 = torch.compile(_stage2_pre_cross_attn, dynamic=False, options=_options())
+    compiled_stage2_joint = torch.compile(_stage2_joint_pre_cross_attn, dynamic=False, options=_options())
     compiled_stage3 = torch.compile(_stage3_pre_ffn, dynamic=False, options=_options())
     compiled_stage4 = torch.compile(_stage4_post_ffn, dynamic=False, options=_options())
     a_num_heads = int(driver.ab.num_heads)
@@ -278,10 +290,11 @@ def compile_mot_layer(driver):
         payload = astate.payload
         a_residual_x = payload.x_action
         s_action = a_residual_x.shape[1]
+        plan = separate_attention_plan(attn_mask, s_video, s_action)
 
         # Stage 1: Pre-attention projection & concatenation
         (
-            q_cat, k_cat, v_cat,
+            q_v, k_v, v_v, q_a, k_a, v_a,
             v_gate_msa, v_shift_mlp, v_scale_mlp, v_gate_mlp,
             a_gate_msa, a_shift_mlp, a_scale_mlp, a_gate_mlp,
         ) = compiled_stage1(
@@ -294,10 +307,23 @@ def compile_mot_layer(driver):
             payload.t_mod,
             payload.action_freqs,
             a_num_heads,
+            plan is not None,
         )
 
         # Eager Joint Mixed Attention
-        mixed = driver._mixed_attention(q_cat, k_cat, v_cat, attn_mask)
+        if plan is None:
+            mixed = driver._mixed_attention(q_v, k_v, v_v, attn_mask)
+            stage2 = compiled_stage2_joint
+            stage2_inputs = (mixed, s_video, s_action)
+        else:
+            from openwam.model.video_backbone.wan.models.dit import flash_attention
+
+            attn_v, attn_a = run_attention(
+                split_attention_separate, q_v, None, None, q_a, None, None,
+                plan, a_num_heads, flash_attention, joint_kv=(k_v, v_v), label="mixed_attention",
+            )
+            stage2 = compiled_stage2
+            stage2_inputs = (attn_v, attn_a)
 
         # Stage 2: Post-self-attn gate & cross-attn QKV preparation
         linear_bias2d = bool(cross_attention_kwargs(video_block.cross_attn).get("linear_bias2d", False))
@@ -305,8 +331,8 @@ def compile_mot_layer(driver):
             v_hidden_states, a_x,
             v_ca_q, v_ca_k, v_ca_v, v_ctx_mask, v_ca_k_img, v_ca_v_img,
             a_ca_q, a_ca_k, a_ca_v, a_text_mask,
-        ) = compiled_stage2(
-            mixed, s_video, s_action,
+        ) = stage2(
+            *stage2_inputs,
             video_block, action_block,
             v_residual_x, v_gate_msa,
             a_residual_x, a_gate_msa,
@@ -338,7 +364,6 @@ def compile_mot_layer(driver):
 
         # Stage 3: Cross-attn output projection + norm2 + modulate (with dynamic non-SAC Action FFN fusion)
         sac_active_ffn = active_ffn_boundary()
-
         v_hidden_states, v_mlp_input, a_x, a_mlp_input = compiled_stage3(
             video_block, action_block,
             v_hidden_states, v_attn_out,
@@ -349,7 +374,6 @@ def compile_mot_layer(driver):
             sac_active_ffn,
         )
 
-        # Eager FFN Execution
         if sac_active_ffn:
             v_mlp_output = run_ffn(video_block.ffn, v_mlp_input, video=True)
             a_mlp_output = run_ffn(action_block.ffn, a_mlp_input)
@@ -365,7 +389,6 @@ def compile_mot_layer(driver):
                 v_hidden_states, v_gate_mlp, v_mlp_output,
                 None, None, None,
             )
-
         vstate.hidden_states = v_hidden_states
         payload.x_action = a_x
         return vstate, astate

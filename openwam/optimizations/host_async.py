@@ -38,6 +38,32 @@ def device_scalar(value, device):
     return torch.full((), float(value), device=device, dtype=torch.float32)
 
 
+def device_grad_norm(accelerator):
+    """Read ZeRO-2's already-computed metric without the engine getter's item().
+
+    Accelerate's DeepSpeed clip_grad_norm_ reports this value: the actual
+    unscale/clip has already run in engine.step during backward. Keep the
+    regular API for other optimizers/backends or an unavailable metric.
+    """
+    if getattr(getattr(accelerator, "distributed_type", None), "name", None) != "DEEPSPEED":
+        return None
+    wrapper = getattr(accelerator, "deepspeed_engine_wrapped", None)
+    engine = getattr(wrapper, "engine", None)
+    optimizer = getattr(engine, "optimizer", None)
+    if optimizer is None:
+        return None
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    if (type(optimizer) is not DeepSpeedZeroOptimizer or not optimizer.partition_gradients
+            or optimizer.cpu_offload):
+        return None
+    value = getattr(optimizer, "_global_grad_norm", None)
+    if (not isinstance(value, torch.Tensor) or value.numel() != 1
+            or value.device != accelerator.device):
+        return None
+    return value.detach()
+
+
 class LaggedMetrics:
     """Same cross-rank mean as reduce_step_metrics, delivered one step later."""
 

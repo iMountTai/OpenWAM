@@ -181,7 +181,7 @@ class OpenWAMTrainer:
         """Construct torch.profiler.profile context manager matching DiffSynth-Studio design.
 
         Controlled cleanly by single environment variable:
-          - enable_profiling=true (or 1): profiles rank 0 (wait=15, warmup=0, active=1, repeat=1).
+          - enable_profiling=true (or 1): profiles rank 0 (wait=15, warmup=0, active=2, repeat=1).
           - enable_profiling=all:        profiles all ranks.
 
         OPENWAM_PROFILE_LIGHT=1 disables stacks/shapes and warms up for one
@@ -263,7 +263,7 @@ class OpenWAMTrainer:
 
         return torch.profiler.profile(
             activities=activities,
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=1, repeat=1),
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=2, repeat=1),
             on_trace_ready=trace_handler,
             record_shapes=not light,
             profile_memory=False,
@@ -419,17 +419,29 @@ class OpenWAMTrainer:
         prof_context = self._build_profiler(output_path)
         from openwam.optimizations import enabled
 
+        online_requested = enabled("OPENWAM_OPT_ONLINE_ENCODE")
+        online_eligible = online_requested and grad_accum == 1 and int(dataloader.num_workers) > 0
+        if online_requested and not online_eligible:
+            logger.warning(
+                "[optimizations] online encoding disabled: requires "
+                "gradient_accumulation_steps=1 and dataloader.num_workers>0 "
+                "(got accumulation=%d, num_workers=%d)",
+                grad_accum,
+                int(dataloader.num_workers),
+            )
+
         deferred = None
         if enabled("OPENWAM_OPT_DEFERRED_GATHER"):
             from openwam.optimizations.deferred_gather import DeferredGather
 
-            # With ONLINE_ENCODE the encoder's gather replacement launches it.
+            # Only an eligible OnlineEncoder owns the gather replacement;
+            # accumulation>1 falls back to the normal deferred-gather patch.
             deferred = DeferredGather(
                 self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
-                patch_step=not enabled("OPENWAM_OPT_ONLINE_ENCODE"),
+                patch_step=not online_eligible,
             )
         online = None
-        if enabled("OPENWAM_OPT_ONLINE_ENCODE"):
+        if online_eligible:
             from openwam.optimizations.online_encode import OnlineEncoder
 
             online = OnlineEncoder(
@@ -499,7 +511,13 @@ class OpenWAMTrainer:
                         )
                         if self.accelerator.sync_gradients:
                             if max_grad_norm is not None:
-                                grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
+                                grad_norm_val = None
+                                if lagged is not None:
+                                    from openwam.optimizations.host_async import device_grad_norm
+
+                                    grad_norm_val = device_grad_norm(self.accelerator)
+                                if grad_norm_val is None:
+                                    grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
                                 if lagged is not None:
                                     grad_norm = device_scalar(grad_norm_val, loss.device)
                                 else:

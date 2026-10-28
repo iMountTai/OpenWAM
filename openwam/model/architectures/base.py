@@ -574,7 +574,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
         #                    RoboCOIN/EgoDex/RoboTwin/OXE readers; the
         #                    sample-level enable is ``mask.any(dim=-1)`` so any
         #                    real dim still gates the token in.
-        if sample_mask is None:
+        if packed_mask is not None:
+            # cpu_context_mask already normalized the per-dimension mask and
+            # uploaded its sample-level result as the final context column.
+            # Reuse that device value instead of uploading [B, 1, D] again;
+            # the blocking duplicate copy can drain queued gather/compute work.
+            sample_mask = packed_mask[:, -1:]
+        elif sample_mask is None:
             sample_mask = torch.ones(
                 (proprio.shape[0], 1),
                 dtype=torch.bool,

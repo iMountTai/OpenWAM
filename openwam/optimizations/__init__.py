@@ -113,10 +113,10 @@ def configure_zero(config: dict) -> None:
     if enabled("OPENWAM_OPT_ZERO_OVERLAP"):
         zero = config["zero_optimization"]
         zero.update(overlap_comm=True, contiguous_gradients=True)
-        # Retain the measured ZeRO-2 default and explicit caller configurations.
+        # Use the opt4 ZeRO-2 bucket size; preserve explicit caller settings.
         # Bucket size is in elements, not bytes.
         if zero.get("stage") == 2:
-            zero.setdefault("reduce_bucket_size", 500_000_000)
+            zero.setdefault("reduce_bucket_size", 200_000_000)
         logger.info(
             "[optimizations] ZeRO overlap_comm=True, contiguous_gradients=True, reduce_bucket_size=%s",
             zero.get("reduce_bucket_size", "default"),

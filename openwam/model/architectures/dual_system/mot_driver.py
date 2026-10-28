@@ -128,7 +128,12 @@ class DualSystemMoTDriver:
             device=torch.device("cpu") if split_enabled else device,
         )
         plan = split_mask_plan(mask) if split_enabled else None
-        mask = mask.to(device=device)
+        if enabled("OPENWAM_OPT_HOST_ASYNC"):
+            from openwam.optimizations.host_async import upload
+
+            mask = upload(mask, device)
+        else:
+            mask = mask.to(device=device)
         if plan is not None:
             try:
                 version = mask._version
