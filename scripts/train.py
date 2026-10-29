@@ -28,7 +28,7 @@ faulthandler.enable(file=sys.stderr, all_threads=True)
 def _force_flush_excepthook(exc_type, exc_value, exc_tb):
     rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "?"))
     sys.stderr.write(f"\n===== UNHANDLED EXCEPTION ON RANK {rank} =====\n")
-    traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+    sys.stderr.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
     sys.stderr.flush()
     sys.stdout.flush()
 
@@ -159,10 +159,17 @@ def main(cfg: DictConfig) -> None:
         # Silence stray ``print(...)`` calls in vendored loaders (e.g. diffsynth's
         # ``model_loader.py``) on non-main ranks — they otherwise print "Loading
         # models from: ..." / "Loaded model: { ... }" once per rank, doubling
-        # the startup log. Logging-based output is unaffected.
+        # the startup log. Preserve stderr and explicit file output: Python's
+        # traceback/Hydra error reporters also use builtins.print.
         import builtins
 
-        builtins.print = lambda *a, **kw: None
+        original_print = builtins.print
+
+        def worker_print(*args, **kwargs):
+            if kwargs.get("file") is not None and kwargs["file"] is not sys.stdout:
+                original_print(*args, **kwargs)
+
+        builtins.print = worker_print
 
     sys.path.insert(0, str(PROJECT_ROOT))
     from openwam.optimizations import configure_backends
@@ -182,7 +189,7 @@ def main(cfg: DictConfig) -> None:
 
         rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "?"))
         sys.stderr.write(f"\n===== RANK {rank} EXCEPTION (pre-destroy) =====\n")
-        _tb.print_exc(file=sys.stderr)
+        sys.stderr.write(_tb.format_exc())
         sys.stderr.flush()
         sys.stdout.flush()
         raise

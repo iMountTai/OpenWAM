@@ -134,21 +134,24 @@ def main(cfg: DictConfig) -> None:
     prepare_runtime_constants(architecture)
 
     meta_path = os.path.join(root, store.META)
+    cache_keys = {key: key for key in signature["readers"]}
     if os.path.isfile(meta_path):
         with open(meta_path, encoding="utf-8") as handle:
             # A store built for all tasks can resume a selected task without
             # rewriting its metadata or invalidating the other cached readers.
-            store.validate_signature(json.load(handle), signature)
+            cache_keys = store.validate_signature(json.load(handle), signature)
     elif rank == 0:
         os.makedirs(root, exist_ok=True)
         with open(f"{meta_path}.tmp", "w", encoding="utf-8") as handle:
             json.dump(signature, handle)
         os.replace(f"{meta_path}.tmp", meta_path)
 
+    reader_keys = [cache_keys[store.reader_key(reader)] for reader in readers]
+
     episodes = [(r, e) for r, reader in enumerate(readers) for e in range(len(reader._episode_files))
                 if store.episode_starts(reader, e)]
     mine = [(r, e) for r, e in episodes[rank::world]
-            if not _finished(store.episode_path(root, readers[r], e), len(store.episode_starts(readers[r], e)))]
+            if not _finished(store.episode_path(root, readers[r], e, reader_keys[r]), len(store.episode_starts(readers[r], e)))]
     total = sum(len(store.episode_starts(readers[r], e)) for r, e in mine)
     logger.info("[latent store] rank %d/%d: %d of %d episodes to encode, %d windows",
                 rank, world, len(mine), len(episodes[rank::world]), total)
@@ -173,7 +176,7 @@ def main(cfg: DictConfig) -> None:
         for (key, _), latent in zip(windows[:real], latents[:real]):
             rows[key].append(latent.contiguous())
             if len(rows[key]) == len(store.episode_starts(readers[key[0]], key[1])):
-                _write(store.episode_path(root, readers[key[0]], key[1]), rows.pop(key))
+                _write(store.episode_path(root, readers[key[0]], key[1], reader_keys[key[0]]), rows.pop(key))
                 del resident[key]
         done += real
         batches += 1
