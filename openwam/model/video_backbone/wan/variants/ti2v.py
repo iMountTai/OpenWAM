@@ -12,6 +12,7 @@ class TI2VVariant(WanVariant):
     actually provided."""
 
     needs_first_frame_skip = True
+    needs_train_pixels = False
 
     def build_train_conditioning(self, bb, *, input_latents, ref_images, **kw) -> dict:
         # Extract latent[0] from the already-encoded video latents (no second

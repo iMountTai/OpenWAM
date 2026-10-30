@@ -809,8 +809,13 @@ class WanBase(VideoBackbone):
                     )
                 )
             stacked_inputs = torch.cat(all_input_videos, dim=0)
+            del all_input_videos
             input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
             input_latents = input_latents.to(dtype=dtype, device=device)
+            if video_first and not self._variant.needs_train_pixels:
+                # VAE work is already ordered on the training stream. Drop the
+                # pixel reference before T5 allocations; no device sync needed.
+                stacked_inputs = None
 
         if video_first:
             context, seq_lens = wan_encode.encode_text(
