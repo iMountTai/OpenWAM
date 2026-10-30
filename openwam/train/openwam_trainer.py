@@ -616,14 +616,6 @@ class OpenWAMTrainer:
             from openwam.optimizations.text import collate_cpu_padding
 
             kwargs["collate_fn"] = collate_cpu_padding
-        bb = self.architecture.video_backbone
-        if (enabled("OPENWAM_OPT_UINT8_PREPROCESS") and not enabled("OPENWAM_OPT_VAE_LATENT_CACHE")
-                and type(bb).__name__ == "Wan22Ti2v" and bb.video_encoder is None):
-            from functools import partial
-            from openwam.optimizations.video import collate_uint8_video
-
-            kwargs["collate_fn"] = partial(collate_uint8_video, collate=kwargs["collate_fn"])
-            logger.info("[optimizations] native Wan uint8 pixels packed by DataLoader collator")
         if not shuffle:
             logger.info(
                 "DataLoader shuffle disabled for MixtureDataset; its shuffled index map "
