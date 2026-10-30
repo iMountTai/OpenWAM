@@ -13,6 +13,7 @@ import torch
 from einops import reduce, repeat
 from PIL import Image
 from openwam.optimizations import enabled
+from openwam.optimizations.video import Uint8Video
 
 def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, max_value=1):
     """PIL.Image -> tensor in ``[min_value, max_value]`` on ``(dtype, device)``."""
@@ -24,14 +25,18 @@ def preprocess_image(image, *, dtype, device, pattern="B C H W", min_value=-1, m
 
 
 def preprocess_video(video, *, dtype, device, pattern="B C T H W", min_value=-1, max_value=1):
-    """List[PIL.Image] -> stacked tensor along the ``T`` axis of ``pattern``."""
-    if (enabled("OPENWAM_OPT_UINT8_PREPROCESS") and pattern == "B C T H W"
+    """PIL frames or worker-packed pixels -> tensor along the ``T`` axis."""
+    pixels = torch.as_tensor(video.pixels, device="cpu") if isinstance(video, Uint8Video) else None
+    if (pixels is None and enabled("OPENWAM_OPT_UINT8_PREPROCESS") and pattern == "B C T H W"
             and all(isinstance(frame, Image.Image) and frame.mode in ("RGB", "RGBA") for frame in video)):
+        pixels = torch.from_numpy(np.stack([np.asarray(frame, dtype=np.uint8) for frame in video]))
+    if pixels is not None and pattern == "B C T H W":
         # Cast to the original target dtype BEFORE normalization, preserving
         # BF16 rounding order; only the upload representation changes.
-        pixels = torch.from_numpy(np.stack([np.asarray(frame, dtype=np.uint8) for frame in video]))
         if torch.device(device).type == "cuda":
-            pixels = pixels.pin_memory().to(device=device, non_blocking=True)
+            if not pixels.is_pinned():
+                pixels = pixels.pin_memory()
+            pixels = pixels.to(device=device, non_blocking=True)
         else:
             pixels = pixels.to(device=device)
         pixels = pixels.to(dtype=dtype)
