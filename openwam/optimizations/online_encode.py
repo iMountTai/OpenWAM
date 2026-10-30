@@ -71,19 +71,30 @@ class OnlineEncoder:
         self.step = types.MethodType(replacement, optimizer)
 
     def __enter__(self):
-        # Only this validated frozen native VAE/T5 path may change the order.
-        bb = self.architecture.video_backbone
-        self.original_video_first = getattr(bb, "_openwam_video_first", False)
-        bb._openwam_video_first = True
         self.optimizer.step = self.step
-        logger.info("[optimizations] online next-batch encoding during ZeRO-2 AllGather; pixel inputs: VAE before T5")
+        logger.info("[optimizations] online next-batch encoding during ZeRO-2 AllGather; lookahead pixels: VAE before T5; initial batch: T5 before VAE")
         return self
 
     def __exit__(self, *exc):
         self.optimizer.step = self.original_step
-        self.architecture.video_backbone._openwam_video_first = self.original_video_first
         self.next_batch = None
         self.pending = None
+
+    def _prepare_lookahead(self, batch):
+        # Reorder only after gather has launched. Initial/fallback batches keep
+        # the original T5-first allocation and compilation order.
+        bb = self.architecture.video_backbone
+        previous = bb.__dict__.get("_openwam_video_first")
+        bb._openwam_video_first = True
+        try:
+            with torch.no_grad():
+                values = self.architecture.prepare_inputs(batch if isinstance(batch, list) else [batch])
+            return PreparedInputs(values)
+        finally:
+            if previous is None:
+                del bb._openwam_video_first
+            else:
+                bb._openwam_video_first = previous
 
     def _gather(self, groups_flat, partitioned_param_groups, dp_process_group,
                 start_alignment_factor, allgather_bucket_size):
@@ -94,9 +105,7 @@ class OnlineEncoder:
             if self.next_batch is not None:
                 take, self.next_batch = self.next_batch, None
                 batch = take()
-                with torch.no_grad():
-                    values = self.architecture.prepare_inputs(batch if isinstance(batch, list) else [batch])
-                self.pending = PreparedInputs(values)
+                self.pending = self._prepare_lookahead(batch)
             return
         if self.next_batch is None:
             return self.original_gather(groups_flat, partitioned_param_groups, dp_process_group,
@@ -111,9 +120,7 @@ class OnlineEncoder:
             # The collective has captured its dependency on the optimizer update;
             # everything enqueued below runs on the compute stream alongside it.
             batch = take()
-            with torch.no_grad():
-                values = self.architecture.prepare_inputs(batch if isinstance(batch, list) else [batch])
-            self.pending = PreparedInputs(values)
+            self.pending = self._prepare_lookahead(batch)
         finally:
             # Work.wait makes the training stream wait for the gathered
             # parameters; it must follow the encode so the two overlap. It also

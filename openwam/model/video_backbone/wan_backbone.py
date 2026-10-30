@@ -788,9 +788,9 @@ class WanBase(VideoBackbone):
         )
 
         batch_size = len(frames)
-        # OnlineEncoder validates that native VAE/T5 are frozen and independent.
-        # Submit VAE work first to cover the gather while the host prepares T5.
-        # Stored latents and callers outside OnlineEncoder keep the old order.
+        # OnlineEncoder validates frozen native VAE/T5 and enables this only
+        # while preparing lookahead inputs after the gather has launched.
+        # Initial batches, stored latents and other callers keep the old order.
         video_first = video_latents is None and getattr(self, "_openwam_video_first", False)
         if not video_first:
             context, seq_lens = wan_encode.encode_text(
