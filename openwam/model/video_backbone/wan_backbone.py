@@ -788,14 +788,9 @@ class WanBase(VideoBackbone):
         )
 
         batch_size = len(frames)
-        # OnlineEncoder validates frozen, deterministic native VAE/T5 once.
-        # Keep cache hits in their existing order; pixels can cover the gather
-        # while the host subsequently tokenizes and submits text encoding.
-        video_first = video_latents is None and getattr(self, "_openwam_video_first", False)
-        if not video_first:
-            context, seq_lens = wan_encode.encode_text(
-                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
-            )
+        context, seq_lens = wan_encode.encode_text(
+            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
+        )
 
         stacked_inputs = None
         if video_latents is not None:
@@ -809,18 +804,8 @@ class WanBase(VideoBackbone):
                     )
                 )
             stacked_inputs = torch.cat(all_input_videos, dim=0)
-            del all_input_videos
             input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
             input_latents = input_latents.to(dtype=dtype, device=device)
-            if video_first and not self._variant.needs_train_pixels:
-                # VAE work is already ordered on the training stream. Drop the
-                # pixel reference before T5 allocations; no device sync needed.
-                stacked_inputs = None
-
-        if video_first:
-            context, seq_lens = wan_encode.encode_text(
-                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
-            )
 
         # Variant-specific first-frame / control conditioning lives in
         # ``self._variant``, so this method carries no per-variant ``if``.

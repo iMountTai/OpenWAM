@@ -17,8 +17,6 @@ class WanVariant:
     # variant (TI2V's clean-replacement contract). Surfaced by
     # ``WanBase.needs_first_frame_skip``.
     needs_first_frame_skip: bool = False
-    # Preserve pixels for conditioning unless a variant explicitly opts out.
-    needs_train_pixels: bool = True
 
     def build_train_conditioning(
         self,

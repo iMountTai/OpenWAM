@@ -71,18 +71,12 @@ class OnlineEncoder:
         self.step = types.MethodType(replacement, optimizer)
 
     def __enter__(self):
-        # The validated native frozen encoders do not draw random numbers or
-        # depend on one another. Submit the heavy VAE before T5 host work.
-        bb = self.architecture.video_backbone
-        self.original_video_first = getattr(bb, "_openwam_video_first", False)
-        bb._openwam_video_first = True
         self.optimizer.step = self.step
-        logger.info("[optimizations] online next-batch encoding during ZeRO-2 AllGather; pixel inputs: VAE before T5")
+        logger.info("[optimizations] online next-batch encoding during ZeRO-2 AllGather")
         return self
 
     def __exit__(self, *exc):
         self.optimizer.step = self.original_step
-        self.architecture.video_backbone._openwam_video_first = self.original_video_first
         self.next_batch = None
         self.pending = None
 
