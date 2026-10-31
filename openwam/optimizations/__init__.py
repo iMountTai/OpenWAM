@@ -122,6 +122,15 @@ def configure_zero(config: dict) -> None:
         # Bucket size is in elements, not bytes.
         if zero.get("stage") == 2:
             zero.setdefault("reduce_bucket_size", 100_000_000)
+            import torch
+
+            # Limit transient GEMM workspace before the first BLASLt call (KiB).
+            # PyTorch gives CUBLASLT_WORKSPACE_SIZE priority on HIP as well.
+            if (torch.version.hip and os.environ.get("TORCH_BLAS_PREFER_HIPBLASLT") == "1"
+                    and "CUBLASLT_WORKSPACE_SIZE" not in os.environ
+                    and "HIPBLASLT_WORKSPACE_SIZE" not in os.environ):
+                os.environ["HIPBLASLT_WORKSPACE_SIZE"] = "32768"
+                logger.info("[optimizations] HIP BLASLt workspace default=32 MiB")
         logger.info(
             "[optimizations] ZeRO overlap_comm=True, contiguous_gradients=True, reduce_bucket_size=%s",
             zero.get("reduce_bucket_size", "default"),
