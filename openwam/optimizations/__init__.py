@@ -85,8 +85,6 @@ def configure_zero(config: dict) -> None:
     comm_dtype = os.environ.get("OPENWAM_COMMUNICATION_DATA_TYPE")
     if comm_dtype:
         config["communication_data_type"] = str(comm_dtype).lower()
-        if "zero_optimization" in config and isinstance(config["zero_optimization"], dict):
-            config["zero_optimization"]["communication_data_type"] = str(comm_dtype).lower()
         logger.info("[optimizations] communication_data_type=%s", str(comm_dtype).lower())
     if (enabled("OPENWAM_OPT_ZERO_SCALED_PACK") or enabled("OPENWAM_OPT_ZERO_NORM_OVERLAP")):
         if not enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
