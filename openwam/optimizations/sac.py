@@ -95,6 +95,12 @@ def checkpoint_layers(total: int) -> int:
         val = getattr(_architecture(), "_gradient_checkpointing_layers", None)
         if val is not None:
             return min(total, val)
+    env_val = os.environ.get("OPENWAM_GRADIENT_CHECKPOINTING_LAYERS")
+    if env_val and env_val.strip():
+        try:
+            return min(total, int(env_val))
+        except ValueError:
+            pass
     return total
 
 

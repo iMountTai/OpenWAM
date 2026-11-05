@@ -146,6 +146,9 @@ def _build_accelerator(cfg: DictConfig):
         gradient_clipping=float(max_grad_norm) if max_grad_norm else 0.0,
         offload_optimizer_device=str(t.offload_optimizer_device),
     )
+    comm_dtype = getattr(t, "communication_data_type", None) or os.environ.get("OPENWAM_COMMUNICATION_DATA_TYPE")
+    if comm_dtype:
+        plugin.deepspeed_config["communication_data_type"] = str(comm_dtype).lower()
     # Opt-in scheduling-only settings (OPENWAM_DS_TIMER_NOSYNC, OPENWAM_DS_OVERLAP_COMM).
     apply_deepspeed_runtime_settings(plugin.deepspeed_config)
     from openwam.optimizations import configure_zero

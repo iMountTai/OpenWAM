@@ -46,7 +46,7 @@ def directory():
 
 def requested():
     """Whether training reads the offline store instead of encoding with T5."""
-    if not (enabled("OPENWAM_OPT_TEXT_CACHE") or enabled("OPENWAM_TEXT_CACHE")):
+    if not enabled("OPENWAM_OPT_TEXT_CACHE"):
         return False
     if os.environ.get("OPENWAM_TEXT_CACHE_DIR", "").strip():
         return True

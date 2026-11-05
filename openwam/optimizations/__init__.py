@@ -46,7 +46,13 @@ def configure_backends() -> None:
     from openwam.optimizations.hw_queues import configure as configure_hw_queues
 
     configure_hw_queues()  # Before anything can initialize the HIP runtime.
-    flags = {name: enabled(name) for name in SWITCHES}
+    def _switch_val(name: str):
+        if name in {"OPENWAM_SAC_LAYERS", "OPENWAM_SAC_EXTRA_OPS"}:
+            val = os.environ.get(name, "").strip()
+            return int(val) if val.isdigit() else (1 if val else 0)
+        return int(enabled(name))
+
+    flags = {name: _switch_val(name) for name in SWITCHES}
     from openwam.optimizations.sac import checkpoint_skip_layers, validate
 
     validate()
@@ -76,6 +82,12 @@ def configure_backends() -> None:
 
 
 def configure_zero(config: dict) -> None:
+    comm_dtype = os.environ.get("OPENWAM_COMMUNICATION_DATA_TYPE")
+    if comm_dtype:
+        config["communication_data_type"] = str(comm_dtype).lower()
+        if "zero_optimization" in config and isinstance(config["zero_optimization"], dict):
+            config["zero_optimization"]["communication_data_type"] = str(comm_dtype).lower()
+        logger.info("[optimizations] communication_data_type=%s", str(comm_dtype).lower())
     if (enabled("OPENWAM_OPT_ZERO_SCALED_PACK") or enabled("OPENWAM_OPT_ZERO_NORM_OVERLAP")):
         if not enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
             raise ValueError("ZeRO scaled pack/norm overlap require OPENWAM_OPT_ZERO_REDUCE_SCATTER=1")

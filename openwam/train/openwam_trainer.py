@@ -101,8 +101,18 @@ class OpenWAMTrainer:
         from openwam.model.video_backbone.base import validate_text_encoder_offload
 
         # Reject invalid memory settings before loading any model weights.
+        gc_layers_cfg = cfg_get(t, "gradient_checkpointing_layers", None)
+        if gc_layers_cfg is None and "OPENWAM_GRADIENT_CHECKPOINTING_LAYERS" in os.environ:
+            env_gc = os.environ.get("OPENWAM_GRADIENT_CHECKPOINTING_LAYERS")
+            if env_gc is not None and env_gc.strip():
+                try:
+                    gc_layers_cfg = int(env_gc)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"OPENWAM_GRADIENT_CHECKPOINTING_LAYERS must be an integer, got {env_gc!r}"
+                    ) from exc
         gradient_checkpointing_layers = validate_gradient_checkpointing_layers(
-            cfg_get(t, "gradient_checkpointing_layers", None)
+            gc_layers_cfg
         )
         text_encoder_offload = validate_text_encoder_offload(cfg_get(t, "text_encoder_offload", False))
 
