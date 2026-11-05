@@ -200,6 +200,7 @@ def test_invalid_preset_prevents_training_start(train_module, monkeypatch, tmp_p
         train_module.main.__wrapped__(_preset_config(preset))
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash launcher testing requires a POSIX environment")
 def test_shell_launcher_defers_preset_and_automatically_selects_gpu_count(tmp_path):
     """The shell must not source a legacy preset before Hydra can disable it."""
     fake_bin = tmp_path / "bin"

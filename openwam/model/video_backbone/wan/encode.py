@@ -22,12 +22,26 @@ logger = logging.getLogger(__name__)
 
 def encode_text(prompts: list, *, tokenizer, text_encoder, device, cache=None) -> Tuple[Tensor, Tensor]:
     """umT5 ``(context, seq_lens)``; with a :class:`TrainTextEmbedCache`, see ``encode_text_cached``."""
+    from openwam.optimizations import text_store
+
+    if getattr(text_encoder, "_openwam_text_store", None) is not None or text_store.requested():
+        from openwam.optimizations.text import cached_text
+
+        return cached_text(
+            prompts,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            device=device,
+            encode=lambda p: _encode_text_uncached(p, tokenizer=tokenizer, text_encoder=text_encoder, device=device),
+        )
     if cache is not None:
         return encode_text_cached(prompts, tokenizer=tokenizer, text_encoder=text_encoder, device=device, cache=cache)
     return _encode_text_uncached(prompts, tokenizer=tokenizer, text_encoder=text_encoder, device=device)
 
 
 def _encode_text_uncached(prompts: list, *, tokenizer, text_encoder, device, cache=None) -> Tuple[Tensor, Tensor]:
+    from openwam.optimizations import enabled
+
     ids, mask = tokenizer(
         prompts,
         return_mask=True,
@@ -36,13 +50,19 @@ def _encode_text_uncached(prompts: list, *, tokenizer, text_encoder, device, cac
         padding="max_length",
         truncation=True,
     )
+    cpu_plan = enabled("OPENWAM_OPT_PADDING_PLAN_CPU") and mask.device.type == "cpu"
+    host_lengths = mask.gt(0).sum(dim=1).long() if cpu_plan else None
     ids = ids.to(device)
     mask = mask.to(device)
-    seq_lens = mask.gt(0).sum(dim=1).long()
+    seq_lens = host_lengths if cpu_plan else mask.gt(0).sum(dim=1).long()
     context = _run_encoder(text_encoder, ids, mask, device=device, cache=cache)
-    for i, v in enumerate(seq_lens):
+    lengths_to_zero = host_lengths.tolist() if cpu_plan else seq_lens
+    for i, v in enumerate(lengths_to_zero):
         context[i, v:] = 0
     return context, seq_lens
+
+
+_encode_text = _encode_text_uncached
 
 
 class TrainTextEmbedCache:
@@ -218,10 +238,13 @@ def encode_text_cached(prompts: list, *, tokenizer, text_encoder, device, cache)
         padding="max_length",
         truncation=True,
     )
+    from openwam.optimizations import enabled
+
+    cpu_plan = enabled("OPENWAM_OPT_PADDING_PLAN_CPU") and mask.device.type == "cpu"
     keys = [(ids[i].numpy().tobytes(), mask[i].numpy().tobytes()) for i in range(ids.shape[0])]
     seq_lens_cpu = mask.gt(0).sum(dim=1).long()
     cache.last_max_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
-    seq_lens = _to_device(seq_lens_cpu, device)
+    seq_lens = seq_lens_cpu if cpu_plan else _to_device(seq_lens_cpu, device)
     rows = [cache.get(k) for k in keys]
     n = cache.hits + cache.misses + 1
     if n & (n - 1) == 0 and os.environ.get("RANK", "0") == "0":
@@ -237,7 +260,8 @@ def encode_text_cached(prompts: list, *, tokenizer, text_encoder, device, cache)
             ids, mask, keys, rows, seq_lens_cpu, seq_lens, text_encoder=text_encoder, device=device, cache=cache
         )
     context = _run_encoder(text_encoder, _to_device(ids, device), _to_device(mask, device), device=device, cache=cache)
-    pad = torch.arange(context.shape[1], device=context.device).unsqueeze(0) >= seq_lens.unsqueeze(1)
+    sl_dev = _to_device(seq_lens_cpu, context.device) if cpu_plan else seq_lens
+    pad = torch.arange(context.shape[1], device=context.device).unsqueeze(0) >= sl_dev.unsqueeze(1)
     context.masked_fill_(pad.unsqueeze(-1), 0)
     for i, k in enumerate(keys):
         if cache.get(k) is None:

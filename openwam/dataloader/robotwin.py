@@ -194,59 +194,42 @@ def _pad_and_resize(image: Image.Image, target_height: int, target_width: int) -
     return canvas
 
 
+def _prompt_choices(instructions: dict, ep_file: str, task_name: str):
+    """Raw prompt choices and whether the train reader samples them randomly."""
+    ep_num = os.path.basename(ep_file).replace("episode", "").replace(".hdf5", "")
+    key = f"episode{ep_num}.json"
+    instr = instructions.get(key)
+    if isinstance(instr, dict):
+        pool = instr.get("seen") or instr.get("unseen") or []
+        if pool:
+            return pool, True
+        base = instr.get("instruction")
+    elif isinstance(instr, str):
+        base = instr
+    elif isinstance(instr, list) and instr:
+        base = instr[0] if isinstance(instr[0], str) else str(instr[0])
+    else:
+        base = None
+    if base is None:
+        base = f"The bimanual robot is performing a {task_name} task."
+    return [base], False
+
+
+def _training_prompts(instructions: dict, ep_file: str, task_name: str) -> list[str]:
+    """Every prompt the train reader can emit, without consuming its RNG."""
+    choices, _ = _prompt_choices(instructions, ep_file, task_name)
+    return [format_prompt_for_inference(value) for value in choices]
+
+
 def _resolve_prompt(
     instructions: dict,
     ep_file: str,
     split: str,
     task_name: str,
 ) -> str:
-    """Pure function: build the training-time prompt from raw state.
-
-    Extracted from :meth:`RoboTwinDataset._get_prompt` so tests and
-    downstream adapters can reproduce training-time prompts without having
-    to instantiate a full dataset (no ``__new__`` + private-attr injection).
-
-    Must stay byte-compatible with what training sees — deployment uses the
-    same ``format_prompt_for_inference`` helper.
-
-    Args:
-        instructions: Mapping from ``episode<N>.json`` to a RoboTwin
-            instruction dict (``{"seen": [...], "unseen": [...]}``) or a
-            plain string / list.
-        ep_file: Episode file name or full path (``episode<N>.hdf5``).
-        split: ``"train"`` samples a random instruction from ``seen``;
-            anything else deterministically picks the first entry.
-        task_name: Falls back to ``f"... performing a {task_name} task."``
-            when instructions don't supply a prompt for this episode.
-
-    Returns:
-        The final wrapped prompt string that the model sees.
-    """
-    ep_basename = os.path.basename(ep_file)
-    ep_num = ep_basename.replace("episode", "").replace(".hdf5", "")
-    instr_key = f"episode{ep_num}.json"
-
-    base_prompt = None
-    if instr_key in instructions:
-        instr = instructions[instr_key]
-        if isinstance(instr, dict):
-            # RoboTwin format: {"seen": [...], "unseen": [...]}
-            pool = instr.get("seen") or instr.get("unseen") or []
-            if pool:
-                if split == "train":
-                    base_prompt = random.choice(pool)
-                else:
-                    base_prompt = pool[0]
-            elif "instruction" in instr:
-                base_prompt = instr["instruction"]
-        elif isinstance(instr, str):
-            base_prompt = instr
-        elif isinstance(instr, list) and len(instr) > 0:
-            base_prompt = instr[0] if isinstance(instr[0], str) else str(instr[0])
-
-    if base_prompt is None:
-        base_prompt = f"The bimanual robot is performing a {task_name} task."
-
+    """Pure function: build the training-time prompt from raw state."""
+    choices, randomize = _prompt_choices(instructions, ep_file, task_name)
+    base_prompt = random.choice(choices) if split == "train" and randomize else choices[0]
     return format_prompt_for_inference(base_prompt)
 
 
@@ -526,7 +509,7 @@ class RoboTwinDataset(BaseDataset):
             if normalization_stats_path is not None:
                 stats_path = normalization_stats_path
                 if os.path.exists(stats_path):
-                    print(f"  [normalizer] Using explicit stats file: {stats_path} (exists ✓)")
+                    print(f"  [normalizer] Using explicit stats file: {stats_path} (exists: yes)")
                 else:
                     print(
                         f"  [normalizer] WARNING: explicit normalization_stats_path does not exist: {stats_path}\n"
@@ -768,8 +751,12 @@ class RoboTwinDataset(BaseDataset):
                 f"(actual_raw_len={actual_raw_len}, ep_len={ep_len})."
             )
 
+        # A stored VAE latent replaces JPEG decoding (OPENWAM_OPT_VAE_LATENT_CACHE).
+        latent_store = getattr(self, "_latent_store", None)
         with h5py.File(path, "r") as f:
-            if self.multiview:
+            if latent_store is not None:
+                raw_frames = None
+            elif self.multiview:
                 raw_frames = self._read_multiview_frames(f, self.cameras, start, actual_raw_end)
             else:
                 raw_frames = self._read_camera_frames(f, self.target_camera, start, actual_raw_end)
@@ -778,7 +765,8 @@ class RoboTwinDataset(BaseDataset):
         # Pad to full window if the episode ended early
         if actual_raw_len < self._raw_window_len:
             pad_len = self._raw_window_len - actual_raw_len
-            raw_frames = raw_frames + [raw_frames[-1]] * pad_len
+            if raw_frames is not None:
+                raw_frames = raw_frames + [raw_frames[-1]] * pad_len
             raw_actions = np.concatenate(
                 [raw_actions, np.repeat(raw_actions[-1:], pad_len, axis=0)],
                 axis=0,
@@ -797,9 +785,12 @@ class RoboTwinDataset(BaseDataset):
             raw_actions, unify_dim_mask = map_to_unify(raw_actions.astype(np.float32), self._unify_dst_index, UNIFY_DIM)
 
         # Video: subsampled. State/action: raw rate.
-        sampled_video = [raw_frames[i] for i in self._video_sample_indices]
-        if not self.multiview:
-            sampled_video = [crop_and_resize(frame, self.height, self.width) for frame in sampled_video]
+        if raw_frames is None:
+            sampled_video = None
+        else:
+            sampled_video = [raw_frames[i] for i in self._video_sample_indices]
+            if not self.multiview:
+                sampled_video = [crop_and_resize(frame, self.height, self.width) for frame in sampled_video]
 
         proprio_np = raw_actions[0:1].astype(np.float32)
         action_np = raw_actions[1 : self.num_frames].astype(np.float32)
@@ -839,10 +830,20 @@ class RoboTwinDataset(BaseDataset):
         action_tensor = torch.from_numpy(action_np)
         proprio_tensor = torch.from_numpy(proprio_np)
 
+        extra = {}
+        if latent_store is not None:
+            from openwam.optimizations.latent_cache import FIRST_FRAME_FROM_LATENTS
+
+            extra = {
+                "video_latents": latent_store(ep_idx, start),
+                "video_size": (self.num_video_frames, self.height, self.width),
+            }
+
         return {
+            **extra,
             "video": sampled_video,
             "vace_video": None,
-            "first_frame_image": [sampled_video[0]],
+            "first_frame_image": [FIRST_FRAME_FROM_LATENTS] if sampled_video is None else [sampled_video[0]],
             "action": action_tensor,
             "action_mask": action_mask,
             "video_mask": video_mask,
@@ -862,7 +863,7 @@ class RoboTwinDataset(BaseDataset):
         ep_idx, start = self._window_index[idx]
 
         sample = self._build_sample(ep_idx, start)
-        if self._color_jitter is not None:
+        if self._color_jitter is not None and sample.get("video") is not None:
             # Same jitter factors across the whole clip (temporal consistency).
             sample["video"] = self._color_jitter.apply({"video": sample["video"]})["video"]
             # Keep the first-frame conditioning image in sync with the jittered clip.
@@ -912,6 +913,11 @@ class MultiTaskRoboTwinDataset(BaseDataset):
         if _cam_layout is not None:
             _cam_layout = list(_cam_layout)
 
+        _tasks = _get("tasks", None)
+        extra_kwargs = {}
+        if _tasks is not None:
+            extra_kwargs["tasks"] = list(_tasks)
+
         # normalize_mode can be null/None to disable
         _norm_mode = _get("normalize_mode", "min-max")
         if isinstance(_norm_mode, str) and _norm_mode.lower() in ("none", "null", ""):
@@ -938,6 +944,7 @@ class MultiTaskRoboTwinDataset(BaseDataset):
             unify_action_map=_get("unify_action_map", None),
             unify_state_map=_get("unify_state_map", None),
             color_jitter=_get("color_jitter", None),
+            **extra_kwargs,
         )
 
     def __init__(

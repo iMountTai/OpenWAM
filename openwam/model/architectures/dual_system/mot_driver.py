@@ -31,6 +31,8 @@ from openwam.model.architectures.utils.mask_modes import (
 )
 from openwam.model.kernels import joint_cat
 from openwam.model.kernels.attention import sdpa
+from openwam.optimizations import deferred_gather, enabled
+from openwam.optimizations.sac import active, context_fn, layer_range, run_attention, set_gradient_checkpointing_layers, validate
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
@@ -143,6 +145,11 @@ class DualSystemMoTDriver:
         in both backbones). Output is the same layout. SDPA is used so an
         optional bool ``attn_mask`` (True = keep) can be honored.
         """
+        return run_attention(
+            self._mixed_attention_impl, q_cat, k_cat, v_cat, attn_mask, label="mixed_attention"
+        )
+
+    def _mixed_attention_impl(self, q_cat, k_cat, v_cat, attn_mask):
         n = self.num_heads
         q = rearrange(q_cat, "b s (n d) -> b n s d", n=n)
         k = rearrange(k_cat, "b s (n d) -> b n s d", n=n)
@@ -301,11 +308,17 @@ class DualSystemMoTDriver:
         vx0 = vstate.hidden_states
         ax0 = outer_payload.x_action
 
+        checkpoint_kwargs = {"use_reentrant": False}
+        if active() or enabled("OPENWAM_CHECKPOINT_STATS"):
+            if offload and active():
+                raise ValueError("Complete SAC requires gradient checkpoint offload to be disabled")
+            checkpoint_kwargs["context_fn"] = context_fn(layer_id, self.num_layers)
+
         if offload:
             with torch.autograd.graph.save_on_cpu():
-                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+                new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, **checkpoint_kwargs)
         else:
-            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, use_reentrant=False)
+            new_vx, new_ax = torch.utils.checkpoint.checkpoint(_run, vx0, ax0, **checkpoint_kwargs)
 
         vstate.hidden_states = new_vx
         outer_payload.x_action = new_ax
@@ -333,6 +346,20 @@ class DualSystemMoTDriver:
         """
         requested_layers = validate_gradient_checkpointing_layers(gradient_checkpointing_layers)
         n_ckpt = self.num_layers if requested_layers is None else min(self.num_layers, requested_layers)
+        set_gradient_checkpointing_layers(requested_layers)
+        if active():
+            validate(self.num_layers)
+            if self.ab.training and not use_gradient_checkpointing:
+                raise ValueError("Complete SAC requires training.use_gradient_checkpointing=True")
+            sac_range = layer_range(self.num_layers)
+            if getattr(self, "_reported_sac_layers", None) != sac_range:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[optimizations] standard SAC covers MoT layers [%d, %d) of %d; "
+                    "the no-checkpoint tail of %d layers keeps autograd activations",
+                    *sac_range, self.num_layers, self.num_layers - n_ckpt,
+                )
+                self._reported_sac_layers = sac_range
         # Resolve sequence shapes from the backbone-populated f/h/w fields.
         # ``vstate.hidden_states.shape[1]`` is identical to ``f*tokens_per_frame`` for
         # backbones that carry a 3D ``(B, S, D)`` state (Wan), but for
@@ -362,6 +389,9 @@ class DualSystemMoTDriver:
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
 
         for layer_id in range(self.num_layers):
+            if deferred_gather.PENDING is not None:
+                # OPENWAM_OPT_DEFERRED_GATHER: this layer's parameters may still be in flight.
+                deferred_gather.PENDING.wait_layer(layer_id)
             vstate, astate = self.step(
                 layer_id,
                 vstate,
@@ -370,6 +400,8 @@ class DualSystemMoTDriver:
                 use_gradient_checkpointing=use_gradient_checkpointing and layer_id < n_ckpt,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
+        if deferred_gather.PENDING is not None:
+            deferred_gather.PENDING.finish()
         return vstate, astate
 
 

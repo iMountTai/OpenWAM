@@ -50,6 +50,9 @@ _COMPILED = {}
 # a custom op's input strides, so the fused norm/SiLU/padding kernel in front writes channels-last directly and the
 # next one reads the channels-last output). Same convolutions on the same values; layouts only.
 _CL = os.environ.get("OPENWAM_VAE_CL", "0") == "1"
+if _CL and getattr(torch.version, "hip", None):
+    os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+    os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NDHWC", "1")
 
 
 def _out_len(n, k, s):

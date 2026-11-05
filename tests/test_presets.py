@@ -7,11 +7,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PRESETS = sorted((ROOT / "presets").glob("*.env"))
-SOURCES = "\n".join(p.read_text() for d in ("openwam", "scripts") for p in (ROOT / d).rglob("*.py"))
+SOURCES = "\n".join(p.read_text(encoding="utf-8") for d in ("openwam", "scripts") for p in (ROOT / d).rglob("*.py"))
 
 
 def _entries(path):
-    lines = [ln for ln in path.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
     return [ln.split("=", 1) for ln in lines]
 
 

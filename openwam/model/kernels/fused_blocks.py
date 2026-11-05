@@ -46,6 +46,14 @@ def _compiled(name, fn):
 
 
 def _rms(x, w, eps: float):
+    from openwam.optimizations import enabled as opt_enabled
+
+    if opt_enabled("OPENWAM_OPT_LIGHTOP_NORM") and not torch.compiler.is_compiling():
+        from openwam.optimizations.norms import lightop_rms_norm
+
+        out = lightop_rms_norm(x, w, eps)
+        if out is not None:
+            return out
     dtype = x.dtype
     xf = x.float()
     return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)).to(dtype) * w
@@ -62,7 +70,7 @@ def _global_hooks_present() -> bool:
     )
 
 
-def _standard_forward(module, expected_type) -> bool:
+def _standard_forward(module, expected_type, allow_sac: bool = False) -> bool:
     """Only inline the shipped forward, preserving wrappers and module hooks.
 
     ``requires_grad_(False)`` still permits gradients to inputs, and ``eval()``
@@ -72,10 +80,16 @@ def _standard_forward(module, expected_type) -> bool:
     or replacing a submodule after a previous fast call cannot leave a stale yes.
     """
     attrs = module.__dict__
+    has_forward = "forward" in attrs
+    if has_forward and allow_sac and (
+        attrs.get("_openwam_sac_wrapped", False)
+        or getattr(getattr(module, "forward", None), "_openwam_sac_wrapped", False)
+    ):
+        has_forward = False
     return (
         type(module) is expected_type
         and not attrs.get("_openwam_no_grad_wrapped", False)
-        and "forward" not in attrs
+        and not has_forward
         and not module._forward_pre_hooks
         and not module._forward_hooks
         and not module._backward_pre_hooks
@@ -96,11 +110,11 @@ def _attention_forward_supported(attn, expected_type, rms_type, attention_type=N
 
 def _ffn_forward_supported(ffn) -> bool:
     return (
-        _standard_forward(ffn, torch.nn.Sequential)
+        _standard_forward(ffn, torch.nn.Sequential, allow_sac=True)
         and len(ffn) == 3
-        and _standard_forward(ffn[0], torch.nn.Linear)
-        and _standard_forward(ffn[1], torch.nn.GELU)
-        and _standard_forward(ffn[2], torch.nn.Linear)
+        and _standard_forward(ffn[0], torch.nn.Linear, allow_sac=True)
+        and _standard_forward(ffn[1], torch.nn.GELU, allow_sac=True)
+        and _standard_forward(ffn[2], torch.nn.Linear, allow_sac=True)
     )
 
 
@@ -223,9 +237,17 @@ def wan_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
         float(block.norm3.eps),
         float(ca.norm_q.eps),
     )
+    from openwam.optimizations.sac import active_ffn_boundary, run_attention, run_ffn
+
     ck = ca.norm_k(ca.k(context))
     cv = ca.v(context)
-    cx = attention(cq, ck, cv, ca.num_heads, context_mask)
+    cx = run_attention(attention, cq, ck, cv, ca.num_heads, context_mask, label="video_cross_attention")
+
+    if active_ffn_boundary():
+        hs = hs + F.linear(cx, ca.o.weight, ca.o.bias)
+        m = F.layer_norm(hs, (hs.shape[-1],), None, None, float(block.norm2.eps)) * (1 + scale_mlp) + shift_mlp
+        return hs + gate_mlp * run_ffn(block.ffn, m, video=True)
+
     f1, f2 = block.ffn[0], block.ffn[2]
     return _compiled("post_b", _post_b)(
         hs,
@@ -309,9 +331,17 @@ def act_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
         float(n.eps),
         float(ca.norm_q.eps),
     )
+    from openwam.optimizations.sac import active_ffn_boundary, run_attention, run_ffn
+
     ck = ca.norm_k(ca.k(context))
     cv = ca.v(context)
-    cx = attention(cq, ck, cv, ca.num_heads, text_mask)
+    cx = run_attention(attention, cq, ck, cv, ca.num_heads, text_mask, label="action_cross_attention")
+
+    if active_ffn_boundary():
+        hs = hs + F.linear(cx, ca.o.weight, ca.o.bias)
+        m = F.layer_norm(hs, (hs.shape[-1],), None, None, float(block.ffn_norm.eps)) * (1 + scale_mlp) + shift_mlp
+        return hs + gate_mlp * run_ffn(block.ffn, m, video=False)
+
     f1, f2 = block.ffn[0], block.ffn[2]
     return _compiled("act_post_b", _post_b)(
         hs,
@@ -333,6 +363,15 @@ def act_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
 
 def masked_mha(q, k, v, num_heads: int, mask):
     """(B, Sq, H*D) x (B, Sk, H*D) masked SDPA -> (B, Sq, H*D), as the eager cross-attentions do."""
+    from openwam.optimizations import enabled as opt_enabled
+
+    if opt_enabled("OPENWAM_OPT_FA2_PADDING"):
+        from openwam.optimizations.attention import fa2_padding
+
+        out = fa2_padding(q, k, v, mask, num_heads)
+        if out is not None:
+            return out
+
     from einops import rearrange
 
     from openwam.model.kernels.attention import sdpa

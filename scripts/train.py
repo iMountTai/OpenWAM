@@ -148,6 +148,9 @@ def _build_accelerator(cfg: DictConfig):
     )
     # Opt-in scheduling-only settings (OPENWAM_DS_TIMER_NOSYNC, OPENWAM_DS_OVERLAP_COMM).
     apply_deepspeed_runtime_settings(plugin.deepspeed_config)
+    from openwam.optimizations import configure_zero
+
+    configure_zero(plugin.deepspeed_config)
 
     return accelerate.Accelerator(
         gradient_accumulation_steps=grad_accum,
@@ -182,9 +185,12 @@ def _train(cfg: DictConfig) -> None:
 def _train_openwam(cfg: DictConfig) -> None:
     """Original OpenWAM training path."""
     from openwam.dataloader.registry import build_dataset
+    from openwam.optimizations import configure_backends
     from openwam.train.openwam_trainer import OpenWAMTrainer
     from openwam.train.utils.runtime_tuning import bind_to_gpu_numa_node
     from openwam.train.utils.seeding import seed_everything
+
+    configure_backends()
 
     # OPENWAM_NUMA_BIND=1: before the process group, the dataset and the DataLoader workers exist.
     bind_to_gpu_numa_node()

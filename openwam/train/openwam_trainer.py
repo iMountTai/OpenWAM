@@ -21,15 +21,20 @@ Usage:
     trainer.train()
 """
 
+import contextlib
+import gzip
 import itertools
+import json
 import logging
 import math
 import os
+import time
 
 import torch
 from omegaconf import DictConfig
 
 from openwam.dataloader.collate import openwam_collate
+from openwam.optimizations import prepare_model, prepare_runtime_constants
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
     finalize_keep_weights_only,
@@ -160,6 +165,7 @@ class OpenWAMTrainer:
         freeze_list = list(getattr(m, "freeze", []))
         for name in self.architecture.freeze_modules(freeze_list):
             logger.info("Frozen: %s", name)
+        prepare_model(self.architecture)
 
         # Initialize all schedulers (video + action) inside architecture
         self.architecture.init_training_schedulers(1000)
@@ -183,6 +189,100 @@ class OpenWAMTrainer:
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
         log_parameter_counts(self.architecture, is_main=is_main)
+
+    def _build_profiler(self, output_path: str):
+        """Construct torch.profiler.profile context manager matching DiffSynth-Studio design.
+
+        Controlled cleanly by single environment variable:
+          - enable_profiling=true (or 1): profiles rank 0 (wait=15, warmup=0, active=2, repeat=1).
+          - enable_profiling=all:        profiles all ranks.
+
+        OPENWAM_PROFILE_LIGHT=1 disables stacks/shapes and warms up for one
+        step (wait=14) while retaining the same active ProfilerStep#15.
+        Saves compressed trace directly to:
+          <output_path>/profiler_traces/rank{rank}_trace.json.gz
+        """
+        raw_val = (os.environ.get("enable_profiling") or os.environ.get("ENABLE_PROFILING", "")).strip().lower()
+        if raw_val not in ("true", "1", "all", "yes", "on"):
+            return contextlib.nullcontext()
+
+        if raw_val != "all" and self._rank != 0:
+            return contextlib.nullcontext()
+
+        trace_dir = os.path.join(output_path, "profiler_traces")
+        os.makedirs(trace_dir, exist_ok=True)
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        def _sanitize_trace(trace_path: str):
+            """Ensure GPU streams and CPU threads remain strictly segregated (泾渭分明).
+
+            Fixes ROCm/DCU Kineto quirk where unmapped background threads (DataLoader
+            queues/Inductor pool) during initialization fall back to (pid 0, tid 0),
+            which would otherwise rename GPU Stream 0 to 'thread 0 (python3)' and merge
+            Python call stacks into the GPU stream track.
+            """
+            try:
+                open_fn = gzip.open if trace_path.endswith(".gz") else open
+                with open_fn(trace_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                events = data.get("traceEvents", [])
+                cpu_pid = None
+                for e in events:
+                    if e.get("name") == "process_labels" and e.get("args", {}).get("labels") == "CPU":
+                        cpu_pid = e.get("pid")
+                        break
+
+                modified = False
+                for e in events:
+                    if e.get("pid") == 0 and e.get("cat") == "python_function":
+                        if cpu_pid is not None:
+                            e["pid"] = cpu_pid
+                        modified = True
+                    elif e.get("ph") == "M" and e.get("pid") == 0 and e.get("tid") == 0 and e.get("name") == "thread_name":
+                        if "thread" in e.get("args", {}).get("name", "").lower():
+                            e["args"]["name"] = "stream 0 "
+                            modified = True
+
+                if modified:
+                    with open_fn(trace_path, "wt", encoding="utf-8") as f:
+                        json.dump(data, f)
+            except Exception as err:
+                logger.warning("[PROFILER] Trace sanitize warning: %s", err)
+
+        def trace_handler(prof_inst):
+            step_tag = f"_step{prof_inst.step_num}" if hasattr(prof_inst, "step_num") else ""
+            trace_path = os.path.join(trace_dir, f"rank{self._rank}{step_tag}_trace.json.gz")
+            t0 = time.monotonic()
+            prof_inst.export_chrome_trace(trace_path)
+            _sanitize_trace(trace_path)
+            duration = time.monotonic() - t0
+            msg = f"[PROFILER] Rank {self._rank} exported trace to `{trace_path}` in {duration:.2f}s."
+            logger.info(msg)
+            if self._rank == 0:
+                print(f"\n{msg}\n", flush=True)
+
+        from openwam.optimizations import enabled
+
+        light = enabled("OPENWAM_PROFILE_LIGHT")
+        wait, warmup = (14, 1) if light else (15, 0)
+        logger.info(
+            "[PROFILER] rank=%d wait=%d warmup=%d active=1 with_stack=%s record_shapes=%s traces=`%s`",
+            self._rank, wait, warmup, not light, not light, trace_dir,
+        )
+
+        return torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=2, repeat=1),
+            on_trace_ready=trace_handler,
+            record_shapes=not light,
+            profile_memory=False,
+            with_stack=not light,
+            with_modules=False,
+        )
 
     # (2) Driver — build optimizer/dataloader/scheduler -> setup dir -> accelerate prepare
     #     -> (resume) -> epoch/step loop{compute_loss -> log_step -> save} -> finish_training.
@@ -308,86 +408,179 @@ class OpenWAMTrainer:
 
         assert self.accelerator is not None, "OpenWAMTrainer requires an Accelerator"
 
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_VAE_LATENT_CACHE"):
+            from openwam.optimizations.latent_cache import attach, vae_fingerprint, validate_backbone
+
+            arch = self.accelerator.unwrap_model(self.architecture)
+            validate_backbone(arch)
+            attach(self.dataset, vae_fingerprint(arch.video_backbone.vae))
+
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            arch = self.accelerator.unwrap_model(self.architecture)
+            text_store.attach(self.dataset, arch.video_backbone)
+
+        prof_context = self._build_profiler(output_path)
+
+        online_requested = enabled("OPENWAM_OPT_ONLINE_ENCODE")
+        online_eligible = online_requested and grad_accum == 1 and int(t.dataset_num_workers) > 0
+        if online_requested and not online_eligible:
+            logger.warning(
+                "[optimizations] online encoding disabled: requires "
+                "gradient_accumulation_steps=1 and dataloader.num_workers>0 "
+                "(got accumulation=%d, num_workers=%d)",
+                grad_accum,
+                int(t.dataset_num_workers),
+            )
+
+        deferred = None
+        if enabled("OPENWAM_OPT_DEFERRED_GATHER"):
+            from openwam.optimizations.deferred_gather import DeferredGather
+
+            deferred = DeferredGather(
+                self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
+                patch_step=not online_eligible,
+            )
+        online = None
+        if online_eligible:
+            from openwam.optimizations.online_encode import OnlineEncoder
+
+            online = OnlineEncoder(
+                self.accelerator.unwrap_model(self.architecture), self.architecture.optimizer,
+                num_workers=t.dataset_num_workers, gradient_accumulation_steps=grad_accum,
+                deferred=deferred,
+            )
+        gc_trace = None
+        if enabled("OPENWAM_TRACE_GC"):
+            from openwam.optimizations.gc_trace import GCTrace
+
+            gc_trace = GCTrace(output_path, self._rank)
+        lagged = None
+        if enabled("OPENWAM_OPT_HOST_ASYNC"):
+            from openwam.optimizations.host_async import LaggedMetrics
+
+            lagged = LaggedMetrics(self.accelerator)
+
+        def report(info, metrics):
+            self.log_step(
+                metrics=metrics, **info, batch_size=batch_size,
+                pbar=pbar, wandb_run=wandb_run,
+                debug=debug, output_path=output_path,
+            )
+
+        def flush_metrics():
+            if lagged is not None:
+                for info, metrics in lagged.flush():
+                    report(info, metrics)
+
         # Per-step manual_seed makes timestep + noise sampling in compute_loss
         # reproducible across runs and ZeRO stages: same (rank, step) -> same RNG,
         # different ranks at the same step keep in-batch timestep diversity.
         # Gated on _run_seed so unseeded production runs stay fully stochastic.
-        epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
-        for epoch in epochs:
-            if hasattr(dataloader, "set_epoch"):
-                dataloader.set_epoch(epoch)
-            if hasattr(self.dataset, "set_epoch"):
-                self.dataset.set_epoch(epoch)
-            # On the resumed epoch, skip the batches already consumed before the checkpoint.
-            if epoch == start_epoch and skip_first > 0:
-                from accelerate import skip_first_batches
+        with (prof_context as prof,
+              deferred if deferred is not None else contextlib.nullcontext(),
+              online if online is not None else contextlib.nullcontext(),
+              gc_trace if gc_trace is not None else contextlib.nullcontext()):
+            epochs = itertools.count(start_epoch) if num_epochs is None else range(start_epoch, num_epochs)
+            for epoch in epochs:
+                if hasattr(dataloader, "set_epoch"):
+                    dataloader.set_epoch(epoch)
+                if hasattr(self.dataset, "set_epoch"):
+                    self.dataset.set_epoch(epoch)
+                # On the resumed epoch, skip the batches already consumed before the checkpoint.
+                if epoch == start_epoch and skip_first > 0:
+                    from accelerate import skip_first_batches
 
-                epoch_iter = skip_first_batches(dataloader, skip_first)
-            else:
-                epoch_iter = dataloader
-            for batch in epoch_iter:
-                if self._run_seed is not None:
-                    step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
-                    torch.manual_seed(step_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(step_seed)
-                with self.accelerator.accumulate(self.architecture):
-                    losses = self.compute_loss(batch)
-                    loss = losses["total"]
-                    # Mean (not sum) over gradient-accumulation micro-batches on every DeepSpeed version.
-                    self.accelerator.backward(scale_loss_for_backward(self.accelerator, loss))
+                    epoch_iter = skip_first_batches(dataloader, skip_first)
+                else:
+                    epoch_iter = dataloader
+                if online is not None:
+                    epoch_iter = online.batches(
+                        epoch_iter, global_step=global_step, max_steps=max_steps, save_steps=save_steps
+                    )
+                for batch in epoch_iter:
+                    if self._run_seed is not None:
+                        step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
+                        torch.manual_seed(step_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(step_seed)
+                    with self.accelerator.accumulate(self.architecture):
+                        losses = self.compute_loss(batch)
+                        loss = losses["total"]
+                        # Mean (not sum) over gradient-accumulation micro-batches on every DeepSpeed version.
+                        self.accelerator.backward(scale_loss_for_backward(self.accelerator, loss))
 
-                    grad_norm = torch.tensor(0.0, device=loss.device)
-                    if self.accelerator.sync_gradients:
-                        if max_grad_norm is not None:
-                            grad_norm_val = self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
-                            grad_norm = torch.tensor(float(grad_norm_val), device=loss.device)
-                        optimizer.step()
-                        if scheduler is not None:
-                            scheduler.step()
-                        optimizer.zero_grad()
-                        opt_step += 1
+                        from openwam.optimizations.host_async import device_grad_norm, device_scalar
 
-                global_step += 1
+                        grad_norm = torch.zeros((), dtype=torch.float32, device=loss.device)
+                        if self.accelerator.sync_gradients:
+                            if max_grad_norm is not None:
+                                fast_grad_norm = device_grad_norm(self.accelerator) if lagged is not None else None
+                                grad_norm_val = (
+                                    fast_grad_norm
+                                    if fast_grad_norm is not None
+                                    else self.accelerator.clip_grad_norm_(all_params, max_grad_norm)
+                                )
+                                grad_norm = (
+                                    device_scalar(grad_norm_val, loss.device)
+                                    if lagged is not None
+                                    else torch.tensor(float(grad_norm_val), device=loss.device)
+                                )
+                            optimizer.step()
+                            if scheduler is not None:
+                                scheduler.step()
+                            optimizer.zero_grad()
+                            opt_step += 1
 
-                metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                    global_step += 1
 
-                current_lr = optimizer.param_groups[0]["lr"]
-                _now = _time.monotonic()
-                steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
-                _step_t0 = _now
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    _now = _time.monotonic()
+                    steps_per_sec = 1.0 / max(_now - _step_t0, 1e-9)
+                    _step_t0 = _now
 
-                self.log_step(
-                    metrics=metrics,
-                    global_step=global_step,
-                    opt_step=opt_step,
-                    epoch=epoch,
-                    lr=current_lr,
-                    steps_per_sec=steps_per_sec,
-                    batch_size=batch_size,
-                    pbar=pbar,
-                    wandb_run=wandb_run,
-                    debug=debug,
-                    output_path=output_path,
-                )
-                maybe_freeze_gc(global_step)  # OPENWAM_GC_FREEZE
+                    info = {
+                        "global_step": global_step,
+                        "opt_step": opt_step,
+                        "epoch": epoch,
+                        "lr": current_lr,
+                        "steps_per_sec": steps_per_sec,
+                    }
+                    if lagged is not None:
+                        for ready_info, m in lagged.push(losses, grad_norm, info):
+                            report(ready_info, m)
+                    else:
+                        metrics = reduce_step_metrics(self.accelerator, losses, grad_norm)
+                        report(info, metrics)
 
-                # save_steps: write the weights line (+ the resumable full state when
-                # save_full_states_for_resume=true), then prune in lockstep.
-                if save_steps and global_step > 0 and global_step % save_steps == 0:
-                    save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
-                    if save_full_states_for_resume:
-                        save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
-                    if is_main:
-                        manage_checkpoints(output_path, keep_last_k)
+                    maybe_freeze_gc(global_step)  # OPENWAM_GC_FREEZE
+                    if prof is not None and hasattr(prof, "step"):
+                        prof.step()
 
-                if max_steps and global_step >= max_steps:
-                    pbar.close()
-                    self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
-                    return
+                    # save_steps: write the weights line (+ the resumable full state when
+                    # save_full_states_for_resume=true), then prune in lockstep.
+                    if save_steps and global_step > 0 and global_step % save_steps == 0:
+                        flush_metrics()
+                        if deferred is not None:
+                            deferred.finish()
+                        save_weights(self.accelerator, self.architecture, output_path, global_step, final=False)
+                        if save_full_states_for_resume:
+                            save_full_state(self.accelerator, output_path, global_step, opt_step, epoch)
+                        if is_main:
+                            manage_checkpoints(output_path, keep_last_k)
 
-        pbar.close()
-        self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
+                    if max_steps and global_step >= max_steps:
+                        flush_metrics()
+                        pbar.close()
+                        self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
+                        return
+
+                flush_metrics()
+            pbar.close()
+            self.finish_training(output_path, global_step, save_steps, keep_last_k, is_main, wandb_run)
 
     # (3) Called by train() first — AdamW over the per-module (action/video) LR param groups.
     def build_optimizer(self) -> torch.optim.Optimizer:
@@ -399,7 +592,12 @@ class OpenWAMTrainer:
             video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
         )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
-        return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
+        from openwam.optimizations import enabled
+
+        extra = {"fused": True} if enabled("OPENWAM_OPT_FUSED_ADAMW") else {}
+        return torch.optim.AdamW(
+            params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas, **extra
+        )
 
     # (4) Called by train() — build the training DataLoader (seeded generator when reproducible).
     def build_dataloader(self, batch_size: int) -> torch.utils.data.DataLoader:
@@ -441,12 +639,16 @@ class OpenWAMTrainer:
     def _collate_fn(self):
         """``list``; with ``OPENWAM_FAST_INPUT=1`` and a video backbone that takes uint8
         clip tensors, ``openwam_collate`` (frames converted in the DataLoader workers)."""
+        from openwam.optimizations import enabled
+        from openwam.optimizations.text import collate_cpu_padding, collate_cpu_padding_uint8
+
+        cpu_pad = enabled("OPENWAM_OPT_PADDING_PLAN_CPU")
         if os.environ.get("OPENWAM_FAST_INPUT", "0") != "1":
-            return list
+            return collate_cpu_padding if cpu_pad else list
         if getattr(getattr(self.architecture, "video_backbone", None), "accepts_uint8_clips", False):
-            return openwam_collate
+            return collate_cpu_padding_uint8 if cpu_pad else openwam_collate
         logger.warning("OPENWAM_FAST_INPUT=1: the video backbone takes PIL frames; frames are collated as a list")
-        return list
+        return collate_cpu_padding if cpu_pad else list
 
     # (5) Called by train() — linear-warmup + cosine schedule, or None (constant LR / debug).
     def build_lr_scheduler(self, optimizer, total_opt_steps: int, debug: bool = False):
@@ -542,7 +744,30 @@ class OpenWAMTrainer:
         arch = self.accelerator.unwrap_model(self.architecture)
         # Propagate device down through architecture; frozen modules (T5/VAE) idempotent move.
         arch.set_dtype_device(arch.dtype, self.accelerator.device)
-        arch.move_frozen_to_device(self.accelerator.device)
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_VAE_LATENT_CACHE"):
+            # Stored latents replace the VAE. DeepSpeed moved the whole module to
+            # the device; return the frozen VAE to the CPU and release its memory.
+            arch.move_frozen_to_device(self.accelerator.device, names=("text_encoder",))
+            arch.video_backbone.vae.to(device="cpu")
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] VAE kept on CPU; training reads stored latents")
+        else:
+            arch.move_frozen_to_device(self.accelerator.device)
+        from openwam.optimizations import text_store
+
+        if text_store.requested():
+            text_store.offload(arch.video_backbone)
+            torch.cuda.empty_cache()
+            logger.info("[optimizations] T5 weights moved to CPU for offline text caching")
+        prepare_runtime_constants(arch)
+
+        if enabled("OPENWAM_OPT_ZERO_REDUCE_SCATTER"):
+            from openwam.optimizations.zero import install_reduce_scatter
+
+            install_reduce_scatter(self.architecture.optimizer)
+
         logger.info(
             "architecture wrapped (%s), device=%s",
             type(self.architecture).__name__,
@@ -579,10 +804,23 @@ class OpenWAMTrainer:
     # (9) Called each step in train()'s loop — joint video-action loss dict (total/video/action).
     def compute_loss(self, batch) -> dict:
         """Compute joint video-action loss. Returns dict: total/video/action."""
-        if not isinstance(batch, list):
-            batch = [batch]
+        from openwam.optimizations import enabled
 
-        inputs = self.architecture.prepare_inputs(batch)
+        if enabled("OPENWAM_CHECKPOINT_STATS"):
+            from openwam.optimizations.sac import begin_step
+
+            begin_step(self.accelerator.device)
+        from openwam.optimizations import deferred_gather
+        from openwam.optimizations.online_encode import PreparedInputs
+
+        # OPENWAM_OPT_DEFERRED_GATHER: non-layer parameters may still be in flight.
+        deferred_gather.wait_prologue()
+        if isinstance(batch, PreparedInputs):
+            inputs = batch.values
+        else:
+            if not isinstance(batch, list):
+                batch = [batch]
+            inputs = self.architecture.prepare_inputs(batch)
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
 
@@ -615,6 +853,12 @@ class OpenWAMTrainer:
         output_path,
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_CHECKPOINT_STATS"):
+            from openwam.optimizations.sac import report_step
+
+            report_step(global_step, self.accelerator.device, metrics, steps_per_sec, batch_size, opt_step)
         labels = [("action", "loss_action")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
@@ -683,6 +927,9 @@ class OpenWAMTrainer:
         is_main: bool,
         wandb_run,
     ) -> None:
+        from openwam.optimizations import deferred_gather
+
+        deferred_gather.finish()
         """Unified teardown for every exit path: final weights, drop resume state, close wandb.
 
         Falsy ``save_steps`` = a profiling/no-write run, so no final artifact (matches the

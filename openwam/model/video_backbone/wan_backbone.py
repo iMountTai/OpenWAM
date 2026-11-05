@@ -384,12 +384,14 @@ class WanBase(VideoBackbone):
         constants, so with ``OPENWAM_FAST_INPUT=1`` it is built the same way once
         per grid and device and reused (same values, no per-iteration host sync).
         """
-        use_cache = os.environ.get("OPENWAM_FAST_INPUT", "0") == "1"
+        from openwam.optimizations.host_async import active as host_async_active, upload
+
+        use_cache = os.environ.get("OPENWAM_FAST_INPUT", "0") == "1" or host_async_active()
         cache = self.__dict__.setdefault("_rope_freqs_cache", {})
         key = (int(grid_frames), int(grid_height), int(grid_width), str(device), id(dit.freqs[0]))
         freqs = cache.get(key) if use_cache else None
         if freqs is None:
-            freqs = (
+            raw = (
                 torch.cat(
                     [
                         dit.freqs[0][:grid_frames]
@@ -405,8 +407,8 @@ class WanBase(VideoBackbone):
                     dim=-1,
                 )
                 .reshape(grid_frames * grid_height * grid_width, 1, -1)
-                .to(device)
             )
+            freqs = upload(raw, device) if host_async_active() else raw.to(device)
             if use_cache:
                 cache[key] = freqs
         return freqs
@@ -556,9 +558,9 @@ class WanBase(VideoBackbone):
         the attention call. Lets DualSystemMoTDriver pull video-side Q/K/V before the
         mixed attention; pairs with :meth:`post_attn_at_layer`.
         """
-        q, k, v, post_tuple = self.pre_attn_at_layer_for_compile(layer_id, state)
-        residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_tuple
         block = state.extras["dit"].blocks[layer_id]
+        q, k, v, post_tuple = self.pre_attn_at_layer_for_compile(layer_id, state, block=block)
+        residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_tuple
         post_state = {
             "block": block,
             "residual_x": residual_x,
@@ -570,10 +572,11 @@ class WanBase(VideoBackbone):
         return q, k, v, post_state
 
     def pre_attn_at_layer_for_compile(
-        self, layer_id: int, state: BlockLoopState
+        self, layer_id: int, state: BlockLoopState, *, block=None
     ) -> Tuple[Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         """Compile-friendly Wan pre-attention half using a tensor tuple post-state."""
-        block = state.extras["dit"].blocks[layer_id]
+        if block is None:
+            block = state.extras["dit"].blocks[layer_id]
 
         time_modulation = state.time_mod
         if fused_blocks.wan_block_supported(block, time_modulation):
@@ -593,12 +596,14 @@ class WanBase(VideoBackbone):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
         residual_x = state.hidden_states
-        attn_input = modulate(block.norm1(state.hidden_states), shift_msa, scale_msa)
+        from openwam.optimizations.sac import run_norm
+        attn_input = modulate(run_norm(block.norm1, state.hidden_states), shift_msa, scale_msa)
 
         self_attn = block.self_attn
-        q = self_attn.norm_q(self_attn.q(attn_input))
-        k = self_attn.norm_k(self_attn.k(attn_input))
-        v = self_attn.v(attn_input)
+        from openwam.optimizations.linear_bias2d import video_linear
+        q = run_norm(self_attn.norm_q, video_linear(self_attn.q, attn_input))
+        k = run_norm(self_attn.norm_k, video_linear(self_attn.k, attn_input))
+        v = video_linear(self_attn.v, attn_input)
         q = rope_apply_auto(q, state.rope_freqs, self_attn.num_heads, rope_apply)
         k = rope_apply_auto(k, state.rope_freqs, self_attn.num_heads, rope_apply)
 
@@ -612,6 +617,7 @@ class WanBase(VideoBackbone):
         residuals. ``attn_out`` is the unprojected (pre ``self_attn.o``) attention
         output for the video slice of the joint mixed attention.
         """
+        block = post_state.get("block") if isinstance(post_state, dict) else None
         if isinstance(post_state, dict):
             post_state = (
                 post_state["residual_x"],
@@ -620,13 +626,14 @@ class WanBase(VideoBackbone):
                 post_state["scale_mlp"],
                 post_state["gate_mlp"],
             )
-        return self.post_attn_at_layer_for_compile(layer_id, state, attn_out, post_state)
+        return self.post_attn_at_layer_for_compile(layer_id, state, attn_out, post_state, block=block)
 
     def post_attn_at_layer_for_compile(
-        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: tuple[Tensor, ...]
+        self, layer_id: int, state: BlockLoopState, attn_out: Tensor, post_state: tuple[Tensor, ...], *, block=None
     ) -> BlockLoopState:
         """Compile-friendly Wan post-attention half consuming a tensor tuple."""
-        block = state.extras["dit"].blocks[layer_id]
+        if block is None:
+            block = state.extras["dit"].blocks[layer_id]
         self_attn = block.self_attn
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
@@ -649,15 +656,23 @@ class WanBase(VideoBackbone):
             wan_dit_forward.apply_post_block_residuals(layer_id, state)
             return state
 
-        hidden_states = block.gate(residual_x, gate_msa, self_attn.o(attn_out))
+        from openwam.optimizations.linear_bias2d import cross_attention_kwargs, video_ffn, video_linear
+        from openwam.optimizations.sac import active_ffn_boundary, ffn_boundary, run_ffn as run_complete_ffn, run_norm
+
+        hidden_states = block.gate(residual_x, gate_msa, video_linear(self_attn.o, attn_out))
         context_mask = None
         if state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
         hidden_states = hidden_states + block.cross_attn(
-            block.norm3(hidden_states), state.context, ctx_mask=context_mask
+            run_norm(block.norm3, hidden_states), state.context, ctx_mask=context_mask,
+            **cross_attention_kwargs(block.cross_attn),
         )
-        mlp_input = modulate(block.norm2(hidden_states), shift_mlp, scale_mlp)
-        hidden_states = block.gate(hidden_states, gate_mlp, block.ffn(mlp_input))
+        mlp_input = modulate(run_norm(block.norm2, hidden_states), shift_mlp, scale_mlp)
+        if active_ffn_boundary() or (ffn_boundary() and torch.compiler.is_compiling()):
+            mlp_output = run_complete_ffn(block.ffn, mlp_input, video=True)
+        else:
+            mlp_output = video_ffn(block.ffn, mlp_input)
+        hidden_states = block.gate(hidden_states, gate_mlp, mlp_output)
         state.hidden_states = hidden_states
 
         wan_dit_forward.apply_post_block_residuals(layer_id, state)
@@ -855,33 +870,52 @@ class WanBase(VideoBackbone):
         device = self.device
         dtype = self.dtype
 
-        uint8_clips = isinstance(frames[0], Tensor)
-        if uint8_clips:
-            # (T, H, W, 3) uint8 clips from openwam.dataloader.collate.openwam_collate
-            clip_t, clip_h, clip_w = int(frames[0].shape[0]), int(frames[0].shape[1]), int(frames[0].shape[2])
+        video_latents = kw.get("video_latents")
+        if video_latents is not None:
+            num_frames, height, width = kw["video_size"]
         else:
-            clip_t, clip_h, clip_w = len(frames[0]), frames[0][0].size[1], frames[0][0].size[0]
-        height, width, num_frames = check_resize_height_width(
-            clip_h,
-            clip_w,
-            clip_t,
-            height_division_factor=self._height_division_factor,
-            width_division_factor=self._width_division_factor,
-            time_division_factor=self._time_division_factor,
-            time_division_remainder=self._time_division_remainder,
-        )
+            uint8_clips = isinstance(frames[0], Tensor)
+            if uint8_clips:
+                # (T, H, W, 3) uint8 clips from openwam.dataloader.collate.openwam_collate
+                clip_t, clip_h, clip_w = int(frames[0].shape[0]), int(frames[0].shape[1]), int(frames[0].shape[2])
+            else:
+                clip_t, clip_h, clip_w = len(frames[0]), frames[0][0].size[1], frames[0][0].size[0]
+            height, width, num_frames = check_resize_height_width(
+                clip_h,
+                clip_w,
+                clip_t,
+                height_division_factor=self._height_division_factor,
+                width_division_factor=self._width_division_factor,
+                time_division_factor=self._time_division_factor,
+                time_division_remainder=self._time_division_remainder,
+            )
 
         batch_size = len(frames)
+        from openwam.optimizations import text_store
+
+        has_text_store = (
+            getattr(self.text_encoder, "_openwam_text_store", None) is not None or text_store.requested()
+        )
         text_cache = self.__dict__.get("_train_text_cache")
-        if text_cache is None and os.environ.get("OPENWAM_TEXT_CACHE", "0") == "1":
+        if text_cache is None and os.environ.get("OPENWAM_TEXT_CACHE", "0") == "1" and not has_text_store:
             text_cache = wan_encode.TrainTextEmbedCache(
                 max_entries=int(os.environ.get("OPENWAM_TEXT_CACHE_MAX_ENTRIES", "256"))
             )
             self.__dict__["_train_text_cache"] = text_cache
-        if text_cache is not None and self._text_encoder_offload and not hasattr(text_cache, "offload"):
+        if (
+            text_cache is not None
+            and self._text_encoder_offload
+            and not has_text_store
+            and not hasattr(text_cache, "offload")
+        ):
             # umT5 weights in pinned host memory between cache misses (see wan_encode.TextEncoderOffload)
             text_cache.offload = wan_encode.TextEncoderOffload(self.text_encoder)
-        elif text_cache is None and self._text_encoder_offload and not self.__dict__.get("_offload_warned"):
+        elif (
+            text_cache is None
+            and self._text_encoder_offload
+            and not has_text_store
+            and not self.__dict__.get("_offload_warned")
+        ):
             self.__dict__["_offload_warned"] = True
             logger.warning(
                 "training.text_encoder_offload=true needs OPENWAM_TEXT_CACHE=1 "
@@ -901,29 +935,33 @@ class WanBase(VideoBackbone):
                 ctx = _truncate_padded_context(ctx, text_cache.last_max_len)
             return ctx, sl
 
-        # OPENWAM_VAE_FIRST=1: queue the VAE encode before the text encode. The two are independent (no random
-        # draws, no shared state), so only the launch order changes: the host-side tokenization / cache lookup then
-        # runs while the GPU encodes the clips instead of in front of them.
-        vae_first = os.environ.get("OPENWAM_VAE_FIRST", "0") == "1"
-        if not vae_first:
+        video_first = video_latents is None and (
+            os.environ.get("OPENWAM_VAE_FIRST", "0") == "1" or getattr(self, "_openwam_video_first", False)
+        )
+        if not video_first:
             context, seq_lens = _encode_text()
 
-        if uint8_clips and self.video_encoder is None:
-            stacked_inputs = wan_encode.preprocess_video(
-                list(frames), encoder=None, dtype=self.dtype, device=self.device
-            )
+        stacked_inputs = None
+        if video_latents is not None:
+            input_latents = video_latents.to(dtype=dtype, device=device)
         else:
-            all_input_videos = []
-            for clip_frames in frames:
-                all_input_videos.append(
-                    wan_encode.preprocess_video(
-                        clip_frames, encoder=self.video_encoder, dtype=self.dtype, device=self.device
-                    )
+            if uint8_clips and self.video_encoder is None:
+                stacked_inputs = wan_encode.preprocess_video(
+                    list(frames), encoder=None, dtype=self.dtype, device=self.device
                 )
-            stacked_inputs = torch.cat(all_input_videos, dim=0)
-        input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
-        input_latents = input_latents.to(dtype=dtype, device=device)
-        if vae_first:
+            else:
+                all_input_videos = []
+                for clip_frames in frames:
+                    all_input_videos.append(
+                        wan_encode.preprocess_video(
+                            clip_frames, encoder=self.video_encoder, dtype=self.dtype, device=self.device
+                        )
+                    )
+                stacked_inputs = torch.cat(all_input_videos, dim=0)
+            input_latents = wan_encode.encode_video(stacked_inputs, vae=self.vae, encoder=self.video_encoder)
+            input_latents = input_latents.to(dtype=dtype, device=device)
+
+        if video_first:
             context, seq_lens = _encode_text()
 
         # Variant-specific first-frame / control conditioning lives in

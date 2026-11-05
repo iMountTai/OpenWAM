@@ -70,6 +70,14 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+            from openwam.optimizations.norms import lightop_rms_norm
+
+            out = lightop_rms_norm(x, self.weight, self.eps)
+            if out is not None:
+                return out
         dtype = x.dtype
         normed = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return normed.to(dtype) * self.weight

@@ -38,8 +38,22 @@ fi
 
 # ── GPU / Node topology ──
 # Priority: explicit override > cloud scheduler vars (HOST_GPU_NUM/HOST_NUM) > auto-detect.
-NPROC_PER_NODE="${NPROC_PER_NODE:-${HOST_GPU_NUM:-$(nvidia-smi -L 2>/dev/null | wc -l)}}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+if [[ -z "${NPROC_PER_NODE:-}" ]]; then
+    if [[ -n "${HOST_GPU_NUM:-}" ]]; then
+        NPROC_PER_NODE="${HOST_GPU_NUM}"
+    elif command -v nvidia-smi &>/dev/null; then
+        NPROC_PER_NODE="$(nvidia-smi -L 2>/dev/null | wc -l)"
+    elif command -v hy-smi &>/dev/null; then
+        NPROC_PER_NODE="$(hy-smi 2>/dev/null | grep -E '^[0-9]+' | wc -l)"
+    elif command -v rocm-smi &>/dev/null; then
+        NPROC_PER_NODE="$(rocm-smi -i 2>/dev/null | grep -c 'GPU\[' || true)"
+    else
+        NPROC_PER_NODE="$(python -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo 1)"
+    fi
+fi
+if [[ "${NPROC_PER_NODE:-0}" -le 0 ]]; then
+    NPROC_PER_NODE=1
+fi
 NNODES="${NNODES:-${HOST_NUM:-${WORLD_SIZE:-1}}}"
 NODE_RANK="${NODE_RANK:-${RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"

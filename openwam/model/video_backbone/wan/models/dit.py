@@ -51,8 +51,37 @@ def flash_attention(
     compatibility_mode=False,
     attn_mask: Optional[torch.Tensor] = None,
 ):
+    from openwam.optimizations.sac import dispatcher, run_attention
+
+    return run_attention(
+        _flash_attention_impl,
+        q,
+        k,
+        v,
+        num_heads,
+        compatibility_mode=compatibility_mode,
+        attn_mask=attn_mask,
+    )
+
+
+def _flash_attention_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_heads: int,
+    compatibility_mode=False,
+    attn_mask: Optional[torch.Tensor] = None,
+):
+    from openwam.optimizations import enabled
+
     # FA2/FA3/sage are CUDA half-precision kernels; they raise on anything else.
     fused_ok = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
+    if not compatibility_mode and enabled("OPENWAM_OPT_FA2_PADDING"):
+        from openwam.optimizations.attention import fa2_padding
+
+        padded = fa2_padding(q, k, v, attn_mask, num_heads)
+        if padded is not None:
+            return padded
     if compatibility_mode or attn_mask is not None or not fused_ok:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -105,18 +134,33 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
-    # 3d rope precompute
-    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)
-    h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
-    w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
-    return f_freqs_cis, h_freqs_cis, w_freqs_cis
+    dim_f = dim // 6 * 2
+    dim_h = dim // 6 * 2
+    dim_w = dim - dim_f - dim_h
+
+    freqs_f = 1.0 / (theta ** (torch.arange(0, dim_f, 2)[: (dim_f // 2)].float() / dim_f))
+    freqs_h = 1.0 / (theta ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h))
+    freqs_w = 1.0 / (theta ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w))
+
+    t_f = torch.arange(end, device=freqs_f.device)
+    t_h = torch.arange(end, device=freqs_h.device)
+    t_w = torch.arange(end, device=freqs_w.device)
+
+    freqs_f = torch.outer(t_f, freqs_f)
+    freqs_h = torch.outer(t_h, freqs_h)
+    freqs_w = torch.outer(t_w, freqs_w)
+
+    freqs_f = torch.polar(torch.ones_like(freqs_f), freqs_f)
+    freqs_h = torch.polar(torch.ones_like(freqs_h), freqs_h)
+    freqs_w = torch.polar(torch.ones_like(freqs_w), freqs_w)
+    return freqs_f, freqs_h, freqs_w
 
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
-    # 1d rope precompute
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].double() / dim))
-    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
@@ -137,6 +181,14 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        from openwam.optimizations import enabled
+
+        if enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+            from openwam.optimizations.norms import lightop_rms_norm
+
+            out = lightop_rms_norm(x, self.weight, self.eps)
+            if out is not None:
+                return out
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
 
@@ -168,13 +220,15 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
 
     def forward(self, x, freqs, attn_mask: Optional[torch.Tensor] = None):
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+        from openwam.optimizations.sac import run_norm, run_projection
+
+        q = run_norm(self.norm_q, run_projection(self.q, x))
+        k = run_norm(self.norm_k, run_projection(self.k, x))
+        v = run_projection(self.v, x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v, attn_mask=attn_mask)
-        return self.o(x)
+        return run_projection(self.o, x)
 
 
 class CrossAttention(nn.Module):
@@ -198,7 +252,17 @@ class CrossAttention(nn.Module):
 
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        ctx_mask: Optional[torch.Tensor] = None,
+        *,
+        linear_bias2d: bool = False,
+    ):
+        from openwam.optimizations.linear_bias2d import video_linear
+        from openwam.optimizations.sac import run_attention, run_norm, run_projection
+
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
@@ -206,16 +270,18 @@ class CrossAttention(nn.Module):
                 ctx_mask = ctx_mask[..., 257:]
         else:
             ctx = y
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(ctx))
-        v = self.v(ctx)
-        x = self.attn(q, k, v, attn_mask=ctx_mask)
+        q = run_norm(self.norm_q, video_linear(self.q, x) if linear_bias2d else run_projection(self.q, x))
+        k = run_norm(self.norm_k, run_projection(self.k, ctx))
+        v = run_projection(self.v, ctx)
+        x = run_attention(self.attn, q, k, v, attn_mask=ctx_mask, label="video_cross_attention")
         if self.has_image_input:
-            k_img = self.norm_k_img(self.k_img(img))
-            v_img = self.v_img(img)
-            y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+            k_img = run_norm(self.norm_k_img, run_projection(self.k_img, img))
+            v_img = run_projection(self.v_img, img)
+            y = run_attention(
+                flash_attention, q, k_img, v_img, num_heads=self.num_heads, label="video_cross_attention"
+            )
             x = x + y
-        return self.o(x)
+        return video_linear(self.o, x) if linear_bias2d else run_projection(self.o, x)
 
 
 class GateModule(nn.Module):
@@ -270,9 +336,13 @@ class DiTBlock(nn.Module):
                 scale_mlp.squeeze(2),
                 gate_mlp.squeeze(2),
             )
+        from openwam.optimizations.linear_bias2d import cross_attention_kwargs
+
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, attn_mask=self_attn_mask))
-        x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
+        x = x + self.cross_attn(
+            self.norm3(x), context, ctx_mask=context_mask, **cross_attention_kwargs(self.cross_attn)
+        )
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import gc
+import glob
 import logging
 import os
 import subprocess
@@ -73,27 +74,100 @@ def _gpu_numa_cpus():
     local = int(os.environ.get("LOCAL_RANK", "0"))
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     phys = visible.split(",")[local].strip() if visible else str(local)
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    ).stdout
     bus = None
-    for line in out.splitlines():
-        idx, uuid, pci = [x.strip() for x in line.split(",")]
-        if phys in (idx, uuid):
-            bus = pci
-    if bus is None:
-        return None
-    dom, rest = bus.split(":", 1)
-    sysname = f"{dom[-4:]}:{rest}".lower()  # nvidia-smi: 00000000:1B:00.0, sysfs: 0000:1b:00.0
-    with open(f"/sys/bus/pci/devices/{sysname}/numa_node") as f:
-        node = int(f.read().strip())
-    if node < 0:
-        return None
-    with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
-        return node, _parse_cpulist(f.read())
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+        for line in out.splitlines():
+            parts = [x.strip() for x in line.split(",") if x.strip()]
+            if len(parts) >= 3 and phys in (parts[0], parts[1]):
+                bus = parts[2]
+                break
+    except Exception:
+        bus = None
+
+    if bus is not None:
+        try:
+            dom, rest = bus.split(":", 1)
+            sysname = f"{dom[-4:]}:{rest}".lower()  # nvidia-smi: 00000000:1B:00.0, sysfs: 0000:1b:00.0
+            pci_path = f"/sys/bus/pci/devices/{sysname}/numa_node"
+            if os.path.exists(pci_path):
+                with open(pci_path) as f:
+                    node = int(f.read().strip())
+                if node >= 0:
+                    cpulist_path = f"/sys/devices/system/node/node{node}/cpulist"
+                    if os.path.exists(cpulist_path):
+                        with open(cpulist_path) as f:
+                            return node, _parse_cpulist(f.read())
+        except Exception:
+            pass
+
+    # Fallback for Hygon DCU / ROCm
+    hip_visible = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("ROCR_VISIBLE_DEVICES") or visible
+    hip_phys = hip_visible.split(",")[local].strip() if hip_visible else str(local)
+
+    # 1. Check /sys/class/drm/card{idx}/device/numa_node
+    drm_numa = f"/sys/class/drm/card{hip_phys}/device/numa_node"
+    if os.path.exists(drm_numa):
+        try:
+            with open(drm_numa) as f:
+                node = int(f.read().strip())
+            if node >= 0:
+                cpulist_path = f"/sys/devices/system/node/node{node}/cpulist"
+                if os.path.exists(cpulist_path):
+                    with open(cpulist_path) as f:
+                        return node, _parse_cpulist(f.read())
+        except Exception:
+            pass
+
+    # 2. Check /sys/class/kfd/kfd/topology/nodes/*/properties
+    try:
+        gpu_nodes = []
+        for prop_file in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+            props = {}
+            with open(prop_file) as f:
+                for line in f:
+                    parts = line.strip().split(None, 1)
+                    if len(parts) == 2:
+                        props[parts[0]] = parts[1]
+            if props.get("gpu_id", "0") != "0":
+                gpu_nodes.append(props)
+        if gpu_nodes:
+            idx = int(hip_phys) if hip_phys.isdigit() else local
+            if 0 <= idx < len(gpu_nodes):
+                node = int(gpu_nodes[idx].get("numa_node", "-1"))
+                if node >= 0:
+                    cpulist_path = f"/sys/devices/system/node/node{node}/cpulist"
+                    if os.path.exists(cpulist_path):
+                        with open(cpulist_path) as f:
+                            return node, _parse_cpulist(f.read())
+    except Exception:
+        pass
+
+    # 3. Check rocm-smi
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "-d", hip_phys, "--showtoponuma"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+        for line in out.splitlines():
+            if "(NUMA node" in line:
+                node = int(line.split("(NUMA node")[1].split(")")[0].strip())
+                if node >= 0:
+                    cpulist_path = f"/sys/devices/system/node/node{node}/cpulist"
+                    if os.path.exists(cpulist_path):
+                        with open(cpulist_path) as f:
+                            return node, _parse_cpulist(f.read())
+    except Exception:
+        pass
+
+    return None
 
 
 def bind_to_gpu_numa_node() -> None:

@@ -50,6 +50,8 @@ from openwam.model.action_backbone.components import (
 from openwam.model.kernels import fused_blocks
 from openwam.model.kernels.attention import sdpa
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
+from openwam.optimizations.attention import fa2_padding
+from openwam.optimizations.sac import active_ffn_boundary, ffn_boundary, run_attention, run_ffn, run_norm, run_projection
 
 if TYPE_CHECKING:
     from openwam.model.architectures.base import ActionState
@@ -162,10 +164,16 @@ class BridgeCrossAttention(nn.Module):
         self.norm_k = RMSNorm(self.attn_hidden_dim, eps=eps)
 
     def forward(self, x_action: torch.Tensor, x_video: torch.Tensor, ctx_mask: Optional[torch.Tensor] = None):
-        q = self.norm_q(self.q(x_action))
-        k = self.norm_k(self.k(x_video))
-        v = self.v(x_video)
+        q = run_norm(self.norm_q, run_projection(self.q, x_action))
+        k = run_norm(self.norm_k, run_projection(self.k, x_video))
+        v = run_projection(self.v, x_video)
+        x = run_attention(self._attend, q, k, v, ctx_mask, label="action_cross_attention")
+        return run_projection(self.o, x)
 
+    def _attend(self, q, k, v, ctx_mask):
+        padded = fa2_padding(q, k, v, ctx_mask, self.num_heads)
+        if padded is not None:
+            return padded
         q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
@@ -176,7 +184,7 @@ class BridgeCrossAttention(nn.Module):
                 ctx_mask = ctx_mask.unsqueeze(1)
             x = sdpa(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
-        return self.o(x)
+        return x
 
 
 class CrossAttnActionDiTBlock(nn.Module):
@@ -761,15 +769,10 @@ class ActionDiT(ActionDiTBackbone):
     def pre_attn_at_layer(
         self, layer_id: int, astate: "ActionState"
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """First half of an action block: self-attn norm + AdaLN + Q/K/V + RoPE.
-
-        Returns Q/K/V shaped ``(B, T_action, num_heads * head_dim)`` (matching
-        the layout produced by Wan ``self_attn.q/k/v`` after RMSNorm and RoPE
-        — ready to concatenate with the video Q/K/V).
-        """
-        q_out, k_out, v_out, post_tuple = self.pre_attn_at_layer_for_compile(layer_id, astate)
-        residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_tuple
+        """First half of an action block: self-attn norm + AdaLN + Q/K/V + RoPE."""
         block: SelfAttnActionDiTBlock = self.blocks[layer_id]
+        q_out, k_out, v_out, post_tuple = self.pre_attn_at_layer_for_compile(layer_id, astate, block=block)
+        residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_tuple
         post_state = {
             "block": block,
             "residual_x": residual_x,
@@ -780,14 +783,15 @@ class ActionDiT(ActionDiTBackbone):
         }
         return q_out, k_out, v_out, post_state
 
-    def pre_attn_at_layer_for_compile(self, layer_id: int, astate: "ActionState"):
+    def pre_attn_at_layer_for_compile(self, layer_id: int, astate: "ActionState", *, block=None):
         """Compile-friendly pre-attention half using a tensor tuple post-state.
 
         Returns a 4-tuple ``(q, k, v, post_state)`` where ``post_state`` is the
         tensor tuple ``(residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp)``.
         """
         payload: ActionDiTState = astate.payload
-        block: SelfAttnActionDiTBlock = self.blocks[layer_id]
+        if block is None:
+            block = self.blocks[layer_id]
         residual_x = payload.x_action
 
         if fused_blocks.act_block_supported(block, payload.t_mod):
@@ -798,12 +802,12 @@ class ActionDiT(ActionDiTBackbone):
             ).chunk(6, dim=1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
-            attn_input = block.self_attn_norm(residual_x) * (1 + scale_msa) + shift_msa
+            attn_input = run_norm(block.self_attn_norm, residual_x) * (1 + scale_msa) + shift_msa
 
             sa = block.self_attn
-            q = sa.norm_q(sa.q(attn_input))
-            k = sa.norm_k(sa.k(attn_input))
-            v = sa.v(attn_input)
+            q = run_norm(sa.norm_q, run_projection(sa.q, attn_input))
+            k = run_norm(sa.norm_k, run_projection(sa.k, attn_input))
+            v = run_projection(sa.v, attn_input)
 
         # Apply RoPE in head-split layout to match flash_attn / Wan rope_apply.
         q = rearrange(q, "b s (n d) -> b n s d", n=self._num_heads)
@@ -812,7 +816,7 @@ class ActionDiT(ActionDiTBackbone):
 
         q = rope_apply_1d(q, payload.action_freqs)
         k = rope_apply_1d(k, payload.action_freqs)
-        # Driver consumes (B, S, H*D) — keep modality streams in matching layout.
+        # Driver consumes (B, S, H*D) - keep modality streams in matching layout.
         q_out = rearrange(q, "b n s d -> b s (n d)", n=self._num_heads)
         k_out = rearrange(k, "b n s d -> b s (n d)", n=self._num_heads)
         v_out = rearrange(v, "b n s d -> b s (n d)", n=self._num_heads)
@@ -828,13 +832,9 @@ class ActionDiT(ActionDiTBackbone):
         post_state: dict,
     ) -> "ActionState":
         """Second half of an action block: gate(residual, self_attn.o(attn_out))
-        → action-owned text/proprio cross-attn → FFN.
-
-        ``attn_out`` is the unprojected attention output for the action slice
-        of the joint mixed attention; ``self_attn.o`` is applied here.
-        Language/proprio conditioning uses the action expert's independent
-        ``text_embedding`` stored in :class:`ActionDiTState`.
+        -> action-owned text/proprio cross-attn -> FFN.
         """
+        block = post_state.get("block") if isinstance(post_state, dict) else None
         if isinstance(post_state, dict):
             post_state = (
                 post_state["residual_x"],
@@ -843,7 +843,7 @@ class ActionDiT(ActionDiTBackbone):
                 post_state["scale_mlp"],
                 post_state["gate_mlp"],
             )
-        return self.post_attn_at_layer_for_compile(layer_id, astate, attn_out, post_state)
+        return self.post_attn_at_layer_for_compile(layer_id, astate, attn_out, post_state, block=block)
 
     def post_attn_at_layer_for_compile(
         self,
@@ -851,10 +851,13 @@ class ActionDiT(ActionDiTBackbone):
         astate: "ActionState",
         attn_out: torch.Tensor,
         post_state: tuple[torch.Tensor, ...],
+        *,
+        block=None,
     ) -> "ActionState":
         """Compile-friendly post-attention half consuming a tensor tuple."""
         payload: ActionDiTState = astate.payload
-        block: SelfAttnActionDiTBlock = self.blocks[layer_id]
+        if block is None:
+            block = self.blocks[layer_id]
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
         if payload.context is not None and fused_blocks.act_block_supported(block, payload.t_mod):
@@ -881,7 +884,7 @@ class ActionDiT(ActionDiTBackbone):
             )
             return astate
 
-        x = block.gate(residual_x, gate_msa, block.self_attn.o(attn_out))
+        x = block.gate(residual_x, gate_msa, run_projection(block.self_attn.o, attn_out))
         if payload.context is not None:
             text_mask = payload.context_mask
             if text_mask is not None:
@@ -892,9 +895,11 @@ class ActionDiT(ActionDiTBackbone):
                         "ActionDiTState.context_mask must be [B, L], [B, T_action, L], "
                         f"or broadcastable [B, heads, T_action, L], got {tuple(text_mask.shape)}"
                     )
-            x = x + block.cross_attn(block.context_attn_norm(x), payload.context, ctx_mask=text_mask)
-        mlp_input = block.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
-        x = block.gate(x, gate_mlp, block.ffn(mlp_input))
+            x = x + block.cross_attn(run_norm(block.context_attn_norm, x), payload.context, ctx_mask=text_mask)
+        mlp_input = run_norm(block.ffn_norm, x) * (1 + scale_mlp) + shift_mlp
+        use_ffn_boundary = active_ffn_boundary() or (ffn_boundary() and torch.compiler.is_compiling())
+        mlp_output = run_ffn(block.ffn, mlp_input) if use_ffn_boundary else block.ffn(mlp_input)
+        x = block.gate(x, gate_mlp, mlp_output)
 
         payload.x_action = x
         return astate

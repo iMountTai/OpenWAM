@@ -565,8 +565,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # even when proprio context is globally disabled.
         pipeline_inputs = dict(pipeline_inputs)
         sample_mask = pipeline_inputs.pop("_proprio_sample_mask", None)
+        from openwam.optimizations.attention import cpu_context_mask
+
+        packed_mask = cpu_context_mask(
+            pipeline_inputs, append_proprio=bool(getattr(self, "_use_proprioception_context", False)),
+            sample_mask=sample_mask,
+        )
 
         if not bool(getattr(self, "_use_proprioception_context", False)):
+            if packed_mask is not None:
+                pipeline_inputs["context_mask"] = packed_mask
             return pipeline_inputs
         if self.proprio_encoder is None:
             raise RuntimeError("proprio context is enabled but proprio_encoder is not initialized.")
@@ -591,14 +599,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 )
 
         # Normalize sample_mask to (B, 1) bool on context's device.
-        # Accepted incoming shapes (after stacking in _collect_inputs):
-        #   * (B,)         — legacy 1D enable-per-sample
-        #   * (B, 1)       — legacy "rank-2 enable"
-        #   * (B, 1, D)    — 2D per-dim mask emitted by the post-migration
-        #                    RoboCOIN/EgoDex/RoboTwin/OXE readers; the
-        #                    sample-level enable is ``mask.any(dim=-1)`` so any
-        #                    real dim still gates the token in.
-        if sample_mask is None:
+        if packed_mask is not None:
+            sample_mask = packed_mask[:, -1:]
+        elif sample_mask is None:
             sample_mask = torch.ones(
                 (proprio.shape[0], 1),
                 dtype=torch.bool,
@@ -627,7 +630,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         proprio_token = proprio_token * sample_mask_f
 
         context_mask = pipeline_inputs.get("context_mask")
-        if context_mask is None:
+        if packed_mask is not None:
+            context_mask = packed_mask[:, :-1]
+        elif context_mask is None:
             seq_lens = pipeline_inputs.get("seq_lens")
             if seq_lens is not None:
                 seq_lens = seq_lens.to(device=context.device)
@@ -640,7 +645,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         updated = dict(pipeline_inputs)
         updated["context"] = torch.cat([context, proprio_token], dim=1)
-        updated["context_mask"] = torch.cat([context_mask, sample_mask], dim=1)
+        if packed_mask is not None:
+            updated["context_mask"] = packed_mask
+        else:
+            updated["context_mask"] = torch.cat([context_mask, sample_mask], dim=1)
         # The appended proprio token can sit after padded text tokens, so the
         # resulting valid tokens are not necessarily a contiguous prefix.
         # Keep the original text seq_lens and make context_mask authoritative.
@@ -709,6 +717,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             state_dict = self.state_dict()
         state_dict = _exclude_vlm_from_state_dict(state_dict)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        state_dict = {name: tensor.contiguous() for name, tensor in state_dict.items()}
         save_file(state_dict, path)
 
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
@@ -1018,11 +1027,20 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if any(ref_flags) and not all(ref_flags):
             raise ValueError("Mixed reference images in batch: all samples must be consistent.")
 
+        from openwam.optimizations.latent_cache import stacked
+
+        video_latents = stacked(samples)
+        stored = {}
+        if video_latents is not None:
+            from openwam.optimizations.host_async import upload
+
+            stored = {"video_latents": upload(video_latents, _device), "video_size": samples[0]["video_size"]}
         preprocessed = self.preprocess(
             frames=all_frames,
             text=all_prompts,
             vace_videos=all_vace_videos,
             ref_images=all_ref_images if ref_flags[0] else None,
+            **stored,
         )
 
         action_data = _h2d(torch.cat(all_actions, dim=0), _device) if all_actions[0] is not None else None
@@ -1055,7 +1073,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 all_proprio_masks = [
                     m if m.ndim == 2 else m.reshape(m.shape[0], 1).expand(m.shape[0], pdim) for m in all_proprio_masks
                 ]
-            inputs["proprio_mask"] = _h2d(torch.stack(all_proprio_masks, dim=0).contiguous(), _device)
+            from openwam.optimizations import enabled as opt_enabled
+
+            pmask_stacked = torch.stack(all_proprio_masks, dim=0).contiguous()
+            inputs["proprio_mask"] = (
+                pmask_stacked if opt_enabled("OPENWAM_OPT_PADDING_PLAN_CPU") else _h2d(pmask_stacked, _device)
+            )
 
         if all_action_masks[0] is not None:
             inputs["action_is_pad"] = _h2d(torch.stack([~m for m in all_action_masks], dim=0), _device)
@@ -1142,12 +1165,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # --- Sample video timesteps ---
         video_timestep_ids = torch.randint(min_tb, max_tb, (B,))
+        from openwam.optimizations import enabled, stage_training_indices
+
+        if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+            video_timestep_ids = stage_training_indices(video_timestep_ids, _device)
 
         video_timesteps = _h2d(vb.scheduler.timesteps[video_timestep_ids], _device, _dtype)
         video_sigmas = _h2d(vb.scheduler.sigmas[video_timestep_ids], _device, _dtype)
 
         # --- Add video noise (flow-matching: linear interp + velocity target) ---
-        video_noise = torch.randn_like(inputs["input_latents"])
+        video_noise = torch.randn_like(inputs["input_latents"], memory_format=torch.contiguous_format)
         sigma_bc = video_sigmas.view(B, 1, 1, 1, 1)
         inputs["latents"] = (1 - sigma_bc) * inputs["input_latents"] + sigma_bc * video_noise
         video_target = video_noise - inputs["input_latents"]
@@ -1166,6 +1193,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
         if lambda_action > 0 and actions is not None:
             action_timestep_ids = torch.randint(0, len(action_scheduler.timesteps), (B,))
+            if enabled("OPENWAM_OPT_CONSTANT_CACHE"):
+                action_timestep_ids = stage_training_indices(action_timestep_ids, _device)
 
             action_timesteps = _h2d(action_scheduler.timesteps[action_timestep_ids], _device, _dtype)
             action_sigmas = _h2d(action_scheduler.sigmas[action_timestep_ids], _device, _dtype)
