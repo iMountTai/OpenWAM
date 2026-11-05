@@ -43,9 +43,6 @@ def enabled(name: str, default: bool = False) -> bool:
 
 def configure_backends() -> None:
     """Called by scripts/train.py before model construction and device setup."""
-    from openwam.optimizations.hw_queues import configure as configure_hw_queues
-
-    configure_hw_queues()  # Before anything can initialize the HIP runtime.
     def _switch_val(name: str):
         if name in {"OPENWAM_SAC_LAYERS", "OPENWAM_SAC_EXTRA_OPS"}:
             val = os.environ.get(name, "").strip()
@@ -76,8 +73,6 @@ def configure_backends() -> None:
     if os.environ.get("RANK", "0") == "0":
         settings = {name: int(value) for name, value in flags.items()}
         settings["skip_layers"] = checkpoint_skip_layers()
-        if "GPU_MAX_HW_QUEUES" in os.environ:
-            settings["GPU_MAX_HW_QUEUES"] = int(os.environ["GPU_MAX_HW_QUEUES"])
         logger.info("[optimizations] switches=%s", settings)
 
 
