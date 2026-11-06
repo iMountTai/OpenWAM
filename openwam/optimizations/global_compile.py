@@ -276,11 +276,125 @@ def compile_mot_layer(driver):
         if enabled("OPENWAM_OPT_MOT_SPLIT_ATTN") or attention_boundary() else driver._mixed_attention
     )
 
-    compiled_stage1 = torch.compile(_stage1_pre_attn, dynamic=False, options=_options())
-    compiled_stage2 = torch.compile(_stage2_pre_cross_attn, dynamic=False, options=_options())
-    compiled_stage2_joint = torch.compile(_stage2_joint_pre_cross_attn, dynamic=False, options=_options())
-    compiled_stage3 = torch.compile(_stage3_pre_ffn, dynamic=False, options=_options())
-    compiled_stage4 = torch.compile(_stage4_post_ffn, dynamic=False, options=_options())
+    stage_cache = {}
+
+    def get_stages(video_block, action_block):
+        key = (id(video_block), id(action_block))
+        cached = stage_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # Bind video_block and action_block in closure so compiled functions take ONLY
+        # tensor / primitive arguments (zero nn.Module arguments). TorchDynamo guards
+        # only tensor shapes/dtypes and each layer's stages have cache_size = 1,
+        # completely eliminating the 120 Dynamo guard walks and cache-limit fallbacks.
+        compiled_stage1 = torch.compile(
+            lambda v_residual_x, v_time_mod, v_rope_freqs, a_residual_x, a_t_mod, a_freqs, a_num_heads, separate_qkv: (
+                _stage1_pre_attn(
+                    video_block,
+                    action_block,
+                    v_residual_x,
+                    v_time_mod,
+                    v_rope_freqs,
+                    a_residual_x,
+                    a_t_mod,
+                    a_freqs,
+                    a_num_heads,
+                    separate_qkv,
+                )
+            ),
+            dynamic=False,
+            options=_options(),
+        )
+
+        compiled_stage2 = torch.compile(
+            lambda attn_v, attn_a, v_residual_x, v_gate_msa, a_residual_x, a_gate_msa, v_context, v_context_mask, a_context, a_context_mask, linear_bias2d: (
+                _stage2_pre_cross_attn(
+                    attn_v,
+                    attn_a,
+                    video_block,
+                    action_block,
+                    v_residual_x,
+                    v_gate_msa,
+                    a_residual_x,
+                    a_gate_msa,
+                    v_context,
+                    v_context_mask,
+                    a_context,
+                    a_context_mask,
+                    linear_bias2d,
+                )
+            ),
+            dynamic=False,
+            options=_options(),
+        )
+
+        compiled_stage2_joint = torch.compile(
+            lambda mixed, s_video, s_action, v_residual_x, v_gate_msa, a_residual_x, a_gate_msa, v_context, v_context_mask, a_context, a_context_mask, linear_bias2d: (
+                _stage2_joint_pre_cross_attn(
+                    mixed,
+                    s_video,
+                    s_action,
+                    video_block,
+                    action_block,
+                    v_residual_x,
+                    v_gate_msa,
+                    a_residual_x,
+                    a_gate_msa,
+                    v_context,
+                    v_context_mask,
+                    a_context,
+                    a_context_mask,
+                    linear_bias2d,
+                )
+            ),
+            dynamic=False,
+            options=_options(),
+        )
+
+        compiled_stage3 = torch.compile(
+            lambda v_hidden_states, v_attn_out, v_shift_mlp, v_scale_mlp, a_x, a_attn_out, a_shift_mlp, a_scale_mlp, a_gate_mlp, linear_bias2d, sac_active_ffn: (
+                _stage3_pre_ffn(
+                    video_block,
+                    action_block,
+                    v_hidden_states,
+                    v_attn_out,
+                    v_shift_mlp,
+                    v_scale_mlp,
+                    a_x,
+                    a_attn_out,
+                    a_shift_mlp,
+                    a_scale_mlp,
+                    a_gate_mlp,
+                    linear_bias2d,
+                    sac_active_ffn,
+                )
+            ),
+            dynamic=False,
+            options=_options(),
+        )
+
+        compiled_stage4 = torch.compile(
+            lambda v_hidden_states, v_gate_mlp, v_mlp_output, a_x, a_gate_mlp, a_mlp_output: (
+                _stage4_post_ffn(
+                    video_block,
+                    action_block,
+                    v_hidden_states,
+                    v_gate_mlp,
+                    v_mlp_output,
+                    a_x,
+                    a_gate_mlp,
+                    a_mlp_output,
+                )
+            ),
+            dynamic=False,
+            options=_options(),
+        )
+
+        cached = (compiled_stage1, compiled_stage2, compiled_stage2_joint, compiled_stage3, compiled_stage4)
+        stage_cache[key] = cached
+        return cached
+
     a_num_heads = int(driver.ab.num_heads)
 
     @dispatcher
@@ -292,14 +406,20 @@ def compile_mot_layer(driver):
         s_action = a_residual_x.shape[1]
         plan = separate_attention_plan(attn_mask, s_video, s_action)
 
+        (
+            compiled_stage1,
+            compiled_stage2,
+            compiled_stage2_joint,
+            compiled_stage3,
+            compiled_stage4,
+        ) = get_stages(video_block, action_block)
+
         # Stage 1: Pre-attention projection & concatenation
         (
             q_v, k_v, v_v, q_a, k_a, v_a,
             v_gate_msa, v_shift_mlp, v_scale_mlp, v_gate_mlp,
             a_gate_msa, a_shift_mlp, a_scale_mlp, a_gate_mlp,
         ) = compiled_stage1(
-            video_block,
-            action_block,
             v_residual_x,
             vstate.time_mod,
             vstate.rope_freqs,
@@ -333,7 +453,6 @@ def compile_mot_layer(driver):
             a_ca_q, a_ca_k, a_ca_v, a_text_mask,
         ) = stage2(
             *stage2_inputs,
-            video_block, action_block,
             v_residual_x, v_gate_msa,
             a_residual_x, a_gate_msa,
             vstate.context, vstate.context_mask,
@@ -365,7 +484,6 @@ def compile_mot_layer(driver):
         # Stage 3: Cross-attn output projection + norm2 + modulate (with dynamic non-SAC Action FFN fusion)
         sac_active_ffn = active_ffn_boundary()
         v_hidden_states, v_mlp_input, a_x, a_mlp_input = compiled_stage3(
-            video_block, action_block,
             v_hidden_states, v_attn_out,
             v_shift_mlp, v_scale_mlp,
             a_x, a_attn_out,
@@ -378,14 +496,12 @@ def compile_mot_layer(driver):
             v_mlp_output = run_ffn(video_block.ffn, v_mlp_input, video=True)
             a_mlp_output = run_ffn(action_block.ffn, a_mlp_input)
             v_hidden_states, a_x = compiled_stage4(
-                video_block, action_block,
                 v_hidden_states, v_gate_mlp, v_mlp_output,
                 a_x, a_gate_mlp, a_mlp_output,
             )
         else:
             v_mlp_output = video_ffn(video_block.ffn, v_mlp_input)
             v_hidden_states, _ = compiled_stage4(
-                video_block, action_block,
                 v_hidden_states, v_gate_mlp, v_mlp_output,
                 None, None, None,
             )

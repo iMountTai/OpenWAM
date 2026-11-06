@@ -327,18 +327,20 @@ class PromptContexts:
         context = torch.zeros((len(prompts), stop, self.meta["dim"]), dtype=dtype,
                               pin_memory=target.type == "cuda")
         for index, prompt in enumerate(prompts):
-            array = self.maps.pop(prompt, None)
-            if array is None:
+            cached = self.maps.pop(prompt, None)
+            if cached is None:
                 try:
                     array = _array(self.root, prompt, self.meta, self.lengths[prompt])
                 except (OSError, ValueError, EOFError) as exc:
                     raise ValueError(f"T5 text cache missing/incomplete for {prompt!r}; rerun step 1 ({self.root})") from exc
-            self.maps[prompt] = array
+                raw = torch.from_numpy(np.array(array, copy=True))
+                tensor = raw.view(torch.bfloat16) if dtype == torch.bfloat16 else raw
+                cached = (array, tensor)
+            self.maps[prompt] = cached
             while len(self.maps) > 64:
                 self.maps.popitem(last=False)
             length = self.lengths[prompt]
-            value = torch.from_numpy(np.array(array, copy=True))
-            context[index, :length].copy_(value.view(torch.bfloat16) if dtype == torch.bfloat16 else value)
+            context[index, :length].copy_(cached[1])
         # Lengths intentionally stay on CPU, as in the padding-plan path.
         return context.to(device=target, non_blocking=True), lengths
 
