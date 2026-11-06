@@ -6,12 +6,17 @@ import os
 logger = logging.getLogger(__name__)
 
 SWITCHES = (
+    "OPENWAM_OPT_VAE_CHANNELS_LAST",
     "OPENWAM_OPT_CONSTANT_CACHE",
     "OPENWAM_OPT_TEXT_CACHE",
     "OPENWAM_OPT_FA2_PADDING",
     "OPENWAM_OPT_FA2_MASK_FUSED",
     "OPENWAM_OPT_PADDING_PLAN_CPU",
+    "OPENWAM_OPT_POINTWISE_COMPILE",
+    "OPENWAM_OPT_ROPE_REAL",
     "OPENWAM_OPT_LIGHTOP_NORM",
+    "OPENWAM_OPT_VAE_POINTWISE_COMPILE",
+    "OPENWAM_OPT_GLOBAL_COMPILE",
     "OPENWAM_OPT_LINEAR_BIAS2D",
     "OPENWAM_OPT_MOT_SPLIT_ATTN",
     "OPENWAM_OPT_SAC_FA",
@@ -58,6 +63,14 @@ def configure_backends() -> None:
         from openwam.optimizations.latent_cache import directory
 
         directory()
+    if flags.get("OPENWAM_OPT_VAE_CHANNELS_LAST"):
+        from openwam.optimizations.vae_layout import validate as validate_layout
+
+        validate_layout()
+    if flags.get("OPENWAM_OPT_GLOBAL_COMPILE"):
+        from openwam.optimizations.global_compile import compile_scope
+
+        compile_scope()
     if flags["OPENWAM_OPT_LIGHTOP_NORM"]:
         import torch
 
@@ -65,7 +78,7 @@ def configure_backends() -> None:
             from openwam.optimizations.norms import lightop_ops
 
             lightop_ops()
-    if os.environ.get("OPENWAM_VAE_CL", "0") == "1":
+    if flags.get("OPENWAM_OPT_VAE_CHANNELS_LAST") or os.environ.get("OPENWAM_VAE_CL", "0") == "1":
         import torch
 
         if getattr(torch.version, "hip", None):
@@ -128,10 +141,33 @@ def configure_zero(config: dict) -> None:
 
 
 def prepare_model(architecture) -> None:
-    """Prepare selective activation checkpointing before DeepSpeed."""
+    """Prepare VAE layout, compile and selective activation checkpointing before DeepSpeed."""
     from openwam.optimizations.sac import prepare
 
     prepare(architecture)
+    layout = enabled("OPENWAM_OPT_VAE_CHANNELS_LAST")
+    compile_vae = False
+    if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+        from openwam.optimizations.global_compile import compile_scope
+
+        compile_vae = "vae" in compile_scope()
+    if not layout and not compile_vae:
+        return
+    import torch
+
+    backbone = getattr(architecture, "video_backbone", None)
+    vae = getattr(backbone, "vae", None)
+    if vae is None:
+        logger.warning("[optimizations] VAE preparation skipped: no native Wan VAE")
+        return
+    if layout:
+        torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
+        torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
+        logger.info("[optimizations] native VAE Conv2d/Conv3d weights use channels-last")
+    if compile_vae:
+        from openwam.optimizations.global_compile import compile_vae_encoder
+
+        compile_vae_encoder(vae)
 
 
 def prepare_runtime_constants(architecture) -> None:

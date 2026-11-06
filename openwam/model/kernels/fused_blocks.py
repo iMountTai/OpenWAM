@@ -86,8 +86,9 @@ def _standard_forward(module, expected_type, allow_sac: bool = False) -> bool:
         or getattr(getattr(module, "forward", None), "_openwam_sac_wrapped", False)
     ):
         has_forward = False
+    type_match = type(module) in expected_type if isinstance(expected_type, tuple) else type(module) is expected_type
     return (
-        type(module) is expected_type
+        type_match
         and not attrs.get("_openwam_no_grad_wrapped", False)
         and not has_forward
         and not module._forward_pre_hooks
@@ -127,10 +128,11 @@ def _wan_forward_supported(block) -> bool:
         RMSNorm,
         SelfAttention,
     )
+    from openwam.optimizations.norms import LayerNorm
 
     return (
         _standard_forward(block, DiTBlock)
-        and all(_standard_forward(getattr(block, name), torch.nn.LayerNorm) for name in ("norm1", "norm2", "norm3"))
+        and all(_standard_forward(getattr(block, name), (torch.nn.LayerNorm, LayerNorm)) for name in ("norm1", "norm2", "norm3"))
         and _attention_forward_supported(block.self_attn, SelfAttention, RMSNorm, AttentionModule)
         and _attention_forward_supported(block.cross_attn, CrossAttention, RMSNorm, AttentionModule)
         and _ffn_forward_supported(block.ffn)

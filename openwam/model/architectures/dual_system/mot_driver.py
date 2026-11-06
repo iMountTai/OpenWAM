@@ -101,6 +101,7 @@ class DualSystemMoTDriver:
         if mixed_attn_ckpt in ("0", "1"):
             self.mot_checkpoint_mixed_attn = mixed_attn_ckpt == "1"
         self.attention_mask_mode = attention_mask_mode
+        self._compiled_layer = None
 
         # Allow the architecture / config to override the video v↔v sub-mode.
         # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
@@ -224,6 +225,18 @@ class DualSystemMoTDriver:
             return self._step_checkpointed(
                 layer_id, vstate, astate, attn_mask=attn_mask, offload=use_gradient_checkpointing_offload
             )
+        if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer, mark_mot_text_dynamic
+
+            if "mot" in compile_scope():
+                if vstate.extras.get("vace") is not None:
+                    raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                mark_mot_text_dynamic(vstate, astate)
+                if self._compiled_layer is None:
+                    self._compiled_layer = compile_mot_layer(self)
+                return self._compiled_layer(
+                    vstate.extras["dit"].blocks[layer_id], self.ab.blocks[layer_id], vstate, astate, attn_mask
+                )
         return self._step_impl(layer_id, vstate, astate, attn_mask=attn_mask)
 
     def _step_impl(
@@ -340,6 +353,19 @@ class DualSystemMoTDriver:
         next layer's iteration in ``run_joint_loop``.
         """
         outer_payload = astate.payload
+        compiled = None
+        if enabled("OPENWAM_OPT_GLOBAL_COMPILE"):
+            from openwam.optimizations.global_compile import compile_scope, compile_mot_layer, mark_mot_text_dynamic
+
+            if "mot" in compile_scope():
+                if vstate.extras.get("vace") is not None:
+                    raise ValueError("MoT block compile currently requires the native Wan path without VACE")
+                mark_mot_text_dynamic(vstate, astate)
+                if self._compiled_layer is None:
+                    self._compiled_layer = compile_mot_layer(self)
+                compiled = self._compiled_layer
+                video_block = vstate.extras["dit"].blocks[layer_id]
+                action_block = self.ab.blocks[layer_id]
 
         def _run(vx: Tensor, ax: Tensor) -> Tuple[Tensor, Tensor]:
             local_vstate = copy.copy(vstate)
@@ -348,7 +374,10 @@ class DualSystemMoTDriver:
             local_astate.payload = local_payload
             local_vstate.hidden_states = vx
             local_payload.x_action = ax
-            self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            if compiled is None:
+                self._step_impl(layer_id, local_vstate, local_astate, attn_mask=attn_mask, suppress_inner_attn_ckpt=True)
+            else:
+                compiled(video_block, action_block, local_vstate, local_astate, attn_mask)
             return local_vstate.hidden_states, local_payload.x_action
 
         vx0 = vstate.hidden_states

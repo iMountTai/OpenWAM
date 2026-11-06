@@ -60,6 +60,15 @@ if TYPE_CHECKING:
 _MOT_VARIANTS = ("joint_self_attn", "idm")
 
 
+def _modulate(x, shift, scale):
+    from openwam.optimizations import enabled, pointwise
+    from openwam.optimizations.sac import extras_enabled
+
+    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+        return pointwise.modulate(x, shift, scale)
+    return x * (1 + scale) + shift
+
+
 @dataclass
 class ActionDiTState:
     """Mutable container threaded through the joint self-attention loop.
@@ -262,16 +271,16 @@ class CrossAttnActionDiTBlock(nn.Module):
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         ).chunk(9, dim=1)
 
-        h = self.self_attn_norm(x_action) * (1 + scale_sa) + shift_sa
+        h = _modulate(self.self_attn_norm(x_action), shift_sa, scale_sa)
         x_action = x_action + gate_sa * self.self_attn(h, freqs=freqs)
 
-        h = self.bridge_attn_norm(x_action) * (1 + scale_ca) + shift_ca
+        h = _modulate(self.bridge_attn_norm(x_action), shift_ca, scale_ca)
         x_action = x_action + gate_ca * self.cross_attn(h, x_video)
 
         if context is not None:
             x_action = x_action + self.context_attn(self.context_attn_norm(x_action), context, ctx_mask=context_mask)
 
-        h = self.ffn_norm(x_action) * (1 + scale_ff) + shift_ff
+        h = _modulate(self.ffn_norm(x_action), shift_ff, scale_ff)
         x_action = x_action + gate_ff * self.ffn(h)
 
         return x_action
@@ -327,6 +336,11 @@ class SelfAttnActionDiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
 
     def gate(self, x: torch.Tensor, gate: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        from openwam.optimizations import enabled, pointwise
+        from openwam.optimizations.sac import extras_enabled
+
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+            return pointwise.gate(x, gate, residual)
         return x + gate * residual
 
     def forward(
@@ -340,11 +354,11 @@ class SelfAttnActionDiTBlock(nn.Module):
         chunks = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
-        attn_input = self.self_attn_norm(x) * (1 + scale_msa) + shift_msa
+        attn_input = _modulate(self.self_attn_norm(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(attn_input, freqs=freqs))
         if context is not None:
             x = x + self.cross_attn(self.context_attn_norm(x), context)
-        mlp_input = self.ffn_norm(x) * (1 + scale_mlp) + shift_mlp
+        mlp_input = _modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(mlp_input))
         return x
 
@@ -918,7 +932,7 @@ class ActionDiT(ActionDiTBackbone):
                         f"or broadcastable [B, heads, T_action, L], got {tuple(text_mask.shape)}"
                     )
             x = x + block.cross_attn(run_norm(block.context_attn_norm, x), payload.context, ctx_mask=text_mask)
-        mlp_input = run_norm(block.ffn_norm, x) * (1 + scale_mlp) + shift_mlp
+        mlp_input = _modulate(run_norm(block.ffn_norm, x), shift_mlp, scale_mlp)
         use_ffn_boundary = active_ffn_boundary() or (ffn_boundary() and torch.compiler.is_compiling())
         mlp_output = run_ffn(block.ffn, mlp_input) if use_ffn_boundary else block.ffn(mlp_input)
         x = block.gate(x, gate_mlp, mlp_output)

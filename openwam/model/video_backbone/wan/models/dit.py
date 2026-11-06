@@ -121,6 +121,11 @@ def _flash_attention_impl(
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+    from openwam.optimizations import enabled, pointwise
+    from openwam.optimizations.sac import extras_enabled
+
+    if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+        return pointwise.modulate(x, shift, scale)
     return x * (1 + scale) + shift
 
 
@@ -134,38 +139,27 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
-    dim_f = dim // 6 * 2
-    dim_h = dim // 6 * 2
-    dim_w = dim - dim_f - dim_h
-
-    freqs_f = 1.0 / (theta ** (torch.arange(0, dim_f, 2)[: (dim_f // 2)].float() / dim_f))
-    freqs_h = 1.0 / (theta ** (torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h))
-    freqs_w = 1.0 / (theta ** (torch.arange(0, dim_w, 2)[: (dim_w // 2)].float() / dim_w))
-
-    t_f = torch.arange(end, device=freqs_f.device)
-    t_h = torch.arange(end, device=freqs_h.device)
-    t_w = torch.arange(end, device=freqs_w.device)
-
-    freqs_f = torch.outer(t_f, freqs_f)
-    freqs_h = torch.outer(t_h, freqs_h)
-    freqs_w = torch.outer(t_w, freqs_w)
-
-    freqs_f = torch.polar(torch.ones_like(freqs_f), freqs_f)
-    freqs_h = torch.polar(torch.ones_like(freqs_h), freqs_h)
-    freqs_w = torch.polar(torch.ones_like(freqs_w), freqs_w)
-    return freqs_f, freqs_h, freqs_w
+    # 3d rope precompute
+    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta)
+    h_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
+    w_freqs_cis = precompute_freqs_cis(dim // 3, end, theta)
+    return f_freqs_cis, h_freqs_cis, w_freqs_cis
 
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # 1d rope precompute
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].double() / dim))
+    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex128
     return freqs_cis
 
 
 def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    from openwam.optimizations import enabled, pointwise
+
+    if enabled("OPENWAM_OPT_ROPE_REAL"):
+        return pointwise.rotate(x, freqs).flatten(2)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2))
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
@@ -183,12 +177,10 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         from openwam.optimizations import enabled
 
-        if enabled("OPENWAM_OPT_LIGHTOP_NORM"):
-            from openwam.optimizations.norms import lightop_rms_norm
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or enabled("OPENWAM_OPT_LIGHTOP_NORM"):
+            from openwam.optimizations import pointwise
 
-            out = lightop_rms_norm(x, self.weight, self.eps)
-            if out is not None:
-                return out
+            return pointwise.rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
 
@@ -291,6 +283,11 @@ class GateModule(nn.Module):
         super().__init__()
 
     def forward(self, x, gate, residual):
+        from openwam.optimizations import enabled, pointwise
+        from openwam.optimizations.sac import extras_enabled
+
+        if enabled("OPENWAM_OPT_POINTWISE_COMPILE") or extras_enabled():
+            return pointwise.gate(x, gate, residual)
         return x + gate * residual
 
 
@@ -303,9 +300,11 @@ class DiTBlock(nn.Module):
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=has_image_input)
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
+        from openwam.optimizations.norms import LayerNorm
+
+        self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = LayerNorm(dim, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
