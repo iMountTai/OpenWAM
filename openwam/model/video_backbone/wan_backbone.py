@@ -56,12 +56,10 @@ def _truncate_padded_context(context: Tensor, max_len: Optional[int]) -> Tensor:
     no positional encoding on keys, so keeping the first ``L`` positions with
     ``L >= max(seq_lens)`` leaves the function unchanged while the per-token text
     embedding, K/V projections and norms stop running on hundreds of padding rows.
-    ``L`` is rounded so that ``L + 1`` (with the appended proprio token) is a
-    multiple of 64: one static shape for short prompts.
     """
     if max_len is None or os.environ.get("OPENWAM_CONTEXT_TRUNC", "0") != "1":
         return context
-    keep = ((int(max_len) + 1 + 63) // 64) * 64 - 1
+    keep = max(1, int(max_len))
     if keep >= context.shape[1]:
         return context
     return context[:, :keep].contiguous()
@@ -923,10 +921,14 @@ class WanBase(VideoBackbone):
             )
 
         def _encode_text():
-            if text_cache is None:  # OPENWAM_TEXT_CACHE off: the default encode (no truncation possible)
-                return wan_encode.encode_text(
+            if text_cache is None:  # OPENWAM_TEXT_CACHE off: the default encode
+                ctx, sl = wan_encode.encode_text(
                     text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
                 )
+                if self._variant.supports_context_truncation and sl is not None:
+                    max_len = int(sl.max().item()) if isinstance(sl, torch.Tensor) else max(sl)
+                    ctx = _truncate_padded_context(ctx, max_len)
+                return ctx, sl
             text_cache.last_max_len = None  # set by the cached encode path only; None = keep the padded context
             ctx, sl = wan_encode.encode_text(
                 text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device, cache=text_cache

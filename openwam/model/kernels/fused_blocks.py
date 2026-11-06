@@ -184,6 +184,16 @@ def _post_b(hs, cx, co_w, co_b, shift_mlp, scale_mlp, gate_mlp, f1_w, f1_b, f2_w
     return hs + gate_mlp * F.linear(F.gelu(F.linear(m, f1_w, f1_b), approximate="tanh"), f2_w, f2_b)
 
 
+def _post_b_pre_ffn(hs, cx, co_w, co_b, shift_mlp, scale_mlp, eps2: float):
+    hs = hs + F.linear(cx, co_w, co_b)
+    m = F.layer_norm(hs, (hs.shape[-1],), None, None, eps2) * (1 + scale_mlp) + shift_mlp
+    return hs, m
+
+
+def _post_b_gate(hs, gate_mlp, ffn_out):
+    return hs + gate_mlp * ffn_out
+
+
 def wan_block_supported(block, time_mod) -> bool:
     ca = block.cross_attn
     return (
@@ -244,9 +254,11 @@ def wan_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
     cx = run_attention(attention, cq, ck, cv, ca.num_heads, context_mask, label="video_cross_attention")
 
     if active_ffn_boundary():
-        hs = hs + F.linear(cx, ca.o.weight, ca.o.bias)
-        m = F.layer_norm(hs, (hs.shape[-1],), None, None, float(block.norm2.eps)) * (1 + scale_mlp) + shift_mlp
-        return hs + gate_mlp * run_ffn(block.ffn, m, video=True)
+        hs, m = _compiled("wan_post_b_pre", _post_b_pre_ffn)(
+            hs, cx, ca.o.weight, ca.o.bias, shift_mlp, scale_mlp, float(block.norm2.eps)
+        )
+        ffn_out = run_ffn(block.ffn, m, video=True)
+        return _compiled("wan_post_b_gate", _post_b_gate)(hs, gate_mlp, ffn_out)
 
     f1, f2 = block.ffn[0], block.ffn[2]
     return _compiled("post_b", _post_b)(
@@ -338,9 +350,11 @@ def act_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
     cx = run_attention(attention, cq, ck, cv, ca.num_heads, text_mask, label="action_cross_attention")
 
     if active_ffn_boundary():
-        hs = hs + F.linear(cx, ca.o.weight, ca.o.bias)
-        m = F.layer_norm(hs, (hs.shape[-1],), None, None, float(block.ffn_norm.eps)) * (1 + scale_mlp) + shift_mlp
-        return hs + gate_mlp * run_ffn(block.ffn, m, video=False)
+        hs, m = _compiled("act_post_b_pre", _post_b_pre_ffn)(
+            hs, cx, ca.o.weight, ca.o.bias, shift_mlp, scale_mlp, float(block.ffn_norm.eps)
+        )
+        ffn_out = run_ffn(block.ffn, m, video=False)
+        return _compiled("act_post_b_gate", _post_b_gate)(hs, gate_mlp, ffn_out)
 
     f1, f2 = block.ffn[0], block.ffn[2]
     return _compiled("act_post_b", _post_b)(

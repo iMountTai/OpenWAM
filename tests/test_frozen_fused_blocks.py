@@ -233,3 +233,30 @@ def test_global_hooks_preserve_outputs_and_gradients_by_disabling_fusion(kind, h
     finally:
         handle.remove()
     assert _supported(kind, block)
+
+
+@pytest.mark.parametrize("kind", ["wan", "action"])
+def test_fused_blocks_active_ffn_boundary_compilation(kind, monkeypatch):
+    from openwam.optimizations import sac
+
+    monkeypatch.setattr(sac, "active_ffn_boundary", lambda: True)
+    block = _block(kind)
+    assert _supported(kind, block)
+    calls = []
+
+    def eager_compiled(name, fn):
+        calls.append(name)
+        return fn
+
+    monkeypatch.setattr(fused_blocks, "_compiled", eager_compiled)
+    eager_out, eager_gradients = _run(kind, block, monkeypatch, enabled=False)
+    assert not calls
+    fast_out, fast_gradients = _run(kind, block, monkeypatch, enabled=True)
+    prefix = "wan" if kind == "wan" else "act"
+    assert calls == [f"{prefix}_pre", f"{prefix}_post_a", f"{prefix}_post_b_pre", f"{prefix}_post_b_gate"]
+    torch.testing.assert_close(fast_out, eager_out, rtol=1e-5, atol=1e-6)
+    for actual, expected in zip(fast_gradients, eager_gradients):
+        assert (actual is None) == (expected is None)
+        if actual is not None:
+            torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    assert all(grad is not None and grad.abs().sum() > 0 for grad in fast_gradients[:3])

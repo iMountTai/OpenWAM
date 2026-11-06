@@ -570,3 +570,27 @@ def test_driver_step_checkpoint_no_op_in_eval_mode():
 
     assert torch.allclose(vstate1.hidden_states, vstate2.hidden_states, atol=1e-6)
     assert torch.allclose(astate1.payload.x_action, astate2.payload.x_action, atol=1e-6)
+
+
+def test_driver_split_attention_matches_sdpa(monkeypatch):
+    """OPENWAM_OPT_MOT_SPLIT_ATTN partitions the joint mask into rectangular blocks
+    and produces numerically identical output to SDPA."""
+    monkeypatch.setenv("OPENWAM_OPT_MOT_SPLIT_ATTN", "1")
+    vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
+    driver = DualSystemMoTDriver(vb, ab, attention_mask_mode=ACTION_SEES_VIDEO)
+
+    mask = driver._build_attention_mask(s_video=6, s_action=3, video_tokens_per_frame=2, device=torch.device("cpu"))
+    assert getattr(mask, "_openwam_split_plan", None) is not None
+
+    q = torch.randn(2, 9, 32)
+    k = torch.randn(2, 9, 32)
+    v = torch.randn(2, 9, 32)
+
+    out_split = driver._mixed_attention(q, k, v, mask)
+
+    monkeypatch.setenv("OPENWAM_OPT_MOT_SPLIT_ATTN", "0")
+    mask_nosplit = driver._build_attention_mask(s_video=6, s_action=3, video_tokens_per_frame=2, device=torch.device("cpu"))
+    out_sdpa = driver._mixed_attention(q, k, v, mask_nosplit)
+
+    assert torch.allclose(out_split, out_sdpa, atol=1e-5)

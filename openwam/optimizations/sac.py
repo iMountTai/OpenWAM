@@ -271,42 +271,51 @@ class _Policy:
         self.seen_extra = set()
         self.seen_fa = False
 
-    def __call__(self, ctx, op, *args, **kwargs):
-        name = getattr(getattr(op, "_schema", None), "name", "")
-        region = (_regions.get() or ("",))[-1]
-        active = region != ""
-        choice = None
-        if name in _ATTENTION_OPS:
-            choice = CheckpointPolicy.MUST_SAVE if (self.fa and active and region.endswith("attention")) else CheckpointPolicy.PREFER_RECOMPUTE
-            if choice is CheckpointPolicy.MUST_SAVE:
+    def __call__(self, context, op, *args, **kwargs):
+        region_stack = _regions.get()
+        name = str(op)
+        attention = any(label.endswith("attention") for label in region_stack)
+        ffn = any(label.endswith("ffn") for label in region_stack)
+        save = (
+            (self.fa and attention and name in _ATTENTION_OPS)
+            or (self.ffn and ffn)
+            or (self.gemm and name in _GEMM_OPS)
+            # Padding plans intentionally take different paths on replay.
+            # Extra policies apply to stable FFN/projection/norm/pointwise regions.
+            or (not attention and name in self.extra)
+        )
+        if not context.is_recompute:
+            if self.fa and attention and name in _ATTENTION_OPS:
                 self.seen_fa = True
-        elif active and region.endswith("ffn") and self.ffn:
-            choice = CheckpointPolicy.MUST_SAVE
-        elif name in _GEMM_OPS and self.gemm and active:
-            choice = CheckpointPolicy.MUST_SAVE
-        elif name in self.extra and active:
-            choice = CheckpointPolicy.MUST_SAVE
-            self.seen_extra.add(name)
-        if self.diagnostics and choice is not None:
-            tag = "saved" if choice is CheckpointPolicy.MUST_SAVE else "recomputed"
-            _counts[(ctx, region, tag, name)] += 1
-        return choice
+            if not attention and name in self.extra:
+                self.seen_extra.add(name)
+        if self.diagnostics:
+            phase = "replay" if context.is_recompute else "forward"
+            choice = "saved" if save else "computed"
+            _counts[(phase, region_stack[-1], choice, name)] += 1
+        return CheckpointPolicy.MUST_SAVE if save else CheckpointPolicy.PREFER_RECOMPUTE
 
 
 @contextmanager
 def _checkpoint_scope(mode, phase, policy):
-    if policy is not None and phase == "forward":
-        _counts[(phase, "checkpoint", "entered", "layer")] += 1
-    if mode is None:
-        yield
-        return
     token = _session.set(mode)
+    if enabled("OPENWAM_CHECKPOINT_STATS"):
+        _counts[(phase, "checkpoint", "entered", "layer")] += 1
+        if mode is not None:
+            _counts[(phase, "checkpoint", "selected", "layer")] += 1
     try:
         yield
+        if phase == "forward" and policy is not None:
+            if policy.fa and not policy.seen_fa:
+                raise RuntimeError(
+                    "FA SAC did not intercept an attention forward op in this layer; check the backend/path"
+                )
+            missing = policy.extra - policy.seen_extra
+            if missing:
+                raise RuntimeError(
+                    f"SAC extra ops did not execute in this layer's instrumented regions: {sorted(missing)}"
+                )
     finally:
-        if policy is not None and phase == "forward":
-            if (policy.fa and policy.seen_fa) or (policy.extra and policy.seen_extra == policy.extra):
-                _counts[(phase, "checkpoint", "selected", "layer")] += 1
         _session.reset(token)
 
 

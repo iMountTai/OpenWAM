@@ -100,7 +100,7 @@ def test_context_truncation_keeps_every_valid_position(monkeypatch):
     context = torch.randn(2, 512, 4)
     assert _truncate_padded_context(context, 70) is context  # switch off
     monkeypatch.setenv("OPENWAM_CONTEXT_TRUNC", "1")
-    for max_len, keep in [(1, 63), (63, 63), (64, 127), (300, 319), (511, 511), (512, 512)]:
+    for max_len, keep in [(1, 1), (63, 63), (64, 64), (300, 300), (511, 511), (512, 512)]:
         out = _truncate_padded_context(context, max_len)
         assert out.shape[1] == keep >= max_len
         assert torch.equal(out, context[:, :keep])

@@ -125,7 +125,7 @@ def test_vace_preserves_full_context_on_cache_miss_and_hit(monkeypatch, miss_fas
 
 
 @pytest.mark.parametrize("variant", ["plain", "ti2v"])
-@pytest.mark.parametrize(("prompt_length", "bucket_length"), [(7, 63), (70, 127)])
+@pytest.mark.parametrize(("prompt_length", "bucket_length"), [(7, 7), (70, 70)])
 def test_masked_wan_variants_still_truncate_context(monkeypatch, variant, prompt_length, bucket_length):
     bb = _make_backbone(variant)
     prompts = ["a" * prompt_length, "pick"]
@@ -188,7 +188,7 @@ def test_vace_hints_and_gradients_match_with_truncation_enabled(monkeypatch):
     # Sensitivity control: the old unconditional truncation changes both the
     # unmasked VACE hint and backward, despite the main DiT masking its padding.
     incorrectly_truncated = _truncate_padded_context(reference["context"], 7)
-    assert incorrectly_truncated.shape[1] == 63
+    assert incorrectly_truncated.shape[1] == 7
     bad_hint, _, bad_gradients = forward_backward(incorrectly_truncated)
     assert not torch.allclose(bad_hint, ref_hint, rtol=1e-7, atol=1e-9)
     assert any(not torch.allclose(a, b, rtol=1e-7, atol=1e-9) for a, b in zip(bad_gradients, ref_gradients))
