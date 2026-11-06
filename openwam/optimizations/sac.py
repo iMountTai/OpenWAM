@@ -297,16 +297,16 @@ class _Policy:
 def _checkpoint_scope(mode, phase, policy):
     if policy is not None and phase == "forward":
         _counts[(phase, "checkpoint", "entered", "layer")] += 1
-        if (policy.fa and policy.seen_fa) or (policy.extra and policy.seen_extra == policy.extra):
-            _counts[(phase, "checkpoint", "selected", "layer")] += 1
     if mode is None:
         yield
         return
     token = _session.set(mode)
     try:
-        with mode:
-            yield
+        yield
     finally:
+        if policy is not None and phase == "forward":
+            if (policy.fa and policy.seen_fa) or (policy.extra and policy.seen_extra == policy.extra):
+                _counts[(phase, "checkpoint", "selected", "layer")] += 1
         _session.reset(token)
 
 
