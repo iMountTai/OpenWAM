@@ -79,3 +79,51 @@ def test_fused_rope_is_bitwise_rope_apply(monkeypatch):
     g = torch.randn_like(out)
     got, want = _grads(out, x, g)[0], _grads(ref, x, g)[0]
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+def test_fused_rope_ok_supports_2d_and_3d_freqs(monkeypatch):
+    monkeypatch.setenv("OPENWAM_FUSED_ROPE", "1")
+    monkeypatch.setattr(rope_triton, "_HAVE_TRITON", True)
+    num_heads, head_dim = 16, 64
+    s = 50
+    # Dummy mock tensor with cuda properties
+    class MockCudaTensor:
+        def __init__(self, shape, dtype=torch.bfloat16):
+            self.shape = shape
+            self.dtype = dtype
+            self.is_cuda = True
+            self.device = torch.device("cuda:0")
+            self.ndim = len(shape)
+        def dim(self):
+            return len(self.shape)
+        def is_contiguous(self):
+            return True
+
+    x = MockCudaTensor((16, s, num_heads * head_dim), dtype=torch.bfloat16)
+    # 3D freqs: (S, 1, head_dim // 2)
+    freqs_3d = MockCudaTensor((s, 1, head_dim // 2), dtype=torch.complex128)
+    assert rope_triton.fused_rope_ok(x, freqs_3d, num_heads) is True
+
+    # 2D freqs: (S, head_dim // 2)
+    freqs_2d = MockCudaTensor((s, head_dim // 2), dtype=torch.complex128)
+    assert rope_triton.fused_rope_ok(x, freqs_2d, num_heads) is True
+
+    # Bad shape
+    freqs_bad = MockCudaTensor((s, head_dim // 4), dtype=torch.complex128)
+    assert rope_triton.fused_rope_ok(x, freqs_bad, num_heads) is False
+
+
+def test_rope_apply_auto_2d_freqs_reference_call():
+    calls = []
+    def mock_ref(x, freqs, num_heads):
+        calls.append((x.shape, freqs.shape, num_heads))
+        return x
+
+    # CPU tensors - fused_rope_ok returns False, falls back to reference_fn
+    x = torch.randn(2, 10, 32)
+    freqs_2d = torch.zeros(10, 16, dtype=torch.complex128)
+    out = rope_triton.rope_apply_auto(x, freqs_2d, 2, mock_ref)
+    assert len(calls) == 1
+    # reference_fn receives 3D unsqueezed freqs
+    assert calls[0][1] == (10, 1, 16)
+    assert torch.equal(out, x)

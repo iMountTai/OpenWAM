@@ -116,12 +116,26 @@ class ActionSelfAttention(nn.Module):
         k = self.norm_k(self.k(x))
         v = self.v(x)
 
-        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
         if freqs is not None:
-            q = rope_apply_1d(q, freqs)
-            k = rope_apply_1d(k, freqs)
+            from openwam.model.kernels.rope_triton import fused_rope_ok, rope_apply_auto
+            from openwam.model.video_backbone.wan.models.dit import rope_apply
+
+            if fused_rope_ok(q, freqs, self.num_heads):
+                q = rope_apply_auto(q, freqs, self.num_heads, rope_apply)
+                k = rope_apply_auto(k, freqs, self.num_heads, rope_apply)
+                q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+                k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+                v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+            else:
+                q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+                k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+                v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+                q = rope_apply_1d(q, freqs)
+                k = rope_apply_1d(k, freqs)
+        else:
+            q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+            k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+            v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
         x = get_attention_fn()(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
         return self.o(x)
@@ -809,17 +823,25 @@ class ActionDiT(ActionDiTBackbone):
             k = run_norm(sa.norm_k, run_projection(sa.k, attn_input))
             v = run_projection(sa.v, attn_input)
 
-        # Apply RoPE in head-split layout to match flash_attn / Wan rope_apply.
-        q = rearrange(q, "b s (n d) -> b n s d", n=self._num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=self._num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=self._num_heads)
+        freqs = payload.action_freqs
+        if freqs is not None:
+            from openwam.model.kernels.rope_triton import fused_rope_ok, rope_apply_auto
+            from openwam.model.video_backbone.wan.models.dit import rope_apply
 
-        q = rope_apply_1d(q, payload.action_freqs)
-        k = rope_apply_1d(k, payload.action_freqs)
-        # Driver consumes (B, S, H*D) - keep modality streams in matching layout.
-        q_out = rearrange(q, "b n s d -> b s (n d)", n=self._num_heads)
-        k_out = rearrange(k, "b n s d -> b s (n d)", n=self._num_heads)
-        v_out = rearrange(v, "b n s d -> b s (n d)", n=self._num_heads)
+            if fused_rope_ok(q, freqs, self._num_heads):
+                q_out = rope_apply_auto(q, freqs, self._num_heads, rope_apply)
+                k_out = rope_apply_auto(k, freqs, self._num_heads, rope_apply)
+                v_out = v
+            else:
+                q = rearrange(q, "b s (n d) -> b n s d", n=self._num_heads)
+                k = rearrange(k, "b s (n d) -> b n s d", n=self._num_heads)
+                q = rope_apply_1d(q, freqs)
+                k = rope_apply_1d(k, freqs)
+                q_out = rearrange(q, "b n s d -> b s (n d)", n=self._num_heads)
+                k_out = rearrange(k, "b n s d -> b s (n d)", n=self._num_heads)
+                v_out = v
+        else:
+            q_out, k_out, v_out = q, k, v
 
         post_state = (residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp)
         return q_out, k_out, v_out, post_state

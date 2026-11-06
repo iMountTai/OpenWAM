@@ -594,3 +594,29 @@ def test_driver_split_attention_matches_sdpa(monkeypatch):
     out_sdpa = driver._mixed_attention(q, k, v, mask_nosplit)
 
     assert torch.allclose(out_split, out_sdpa, atol=1e-5)
+
+
+def test_driver_step_impl_split_attention_equivalence(monkeypatch):
+    """DualSystemMoTDriver._step_impl produces identical outputs with and without OPENWAM_OPT_MOT_SPLIT_ATTN."""
+    vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
+    ab.eval()
+    driver = DualSystemMoTDriver(vb, ab, attention_mask_mode=ACTION_SEES_VIDEO)
+
+    vstate1, astate1 = _build_run_inputs(vb, ab, B=2, s_video=6, s_action=3, seed=42)
+    vstate2, astate2 = _build_run_inputs(vb, ab, B=2, s_video=6, s_action=3, seed=42)
+
+    # Build mask with plan
+    monkeypatch.setenv("OPENWAM_OPT_MOT_SPLIT_ATTN", "1")
+    mask = driver._build_attention_mask(s_video=6, s_action=3, video_tokens_per_frame=2, device=torch.device("cpu"))
+    assert getattr(mask, "_openwam_split_plan", None) is not None
+
+    with torch.no_grad():
+        v1, a1 = driver._step_impl(0, vstate1, astate1, attn_mask=mask)
+
+    monkeypatch.setenv("OPENWAM_OPT_MOT_SPLIT_ATTN", "0")
+    with torch.no_grad():
+        v2, a2 = driver._step_impl(0, vstate2, astate2, attn_mask=mask)
+
+    assert torch.allclose(v1.hidden_states, v2.hidden_states, atol=1e-5)
+    assert torch.allclose(a1.payload.x_action, a2.payload.x_action, atol=1e-5)

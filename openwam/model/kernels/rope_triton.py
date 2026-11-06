@@ -121,7 +121,7 @@ def _freqs_real(freqs: torch.Tensor):
 
 
 def fused_rope_ok(x: torch.Tensor, freqs: torch.Tensor, num_heads: int) -> bool:
-    return (
+    if not (
         _HAVE_TRITON
         and os.environ.get("OPENWAM_FUSED_ROPE", "0") == "1"
         and x.is_cuda
@@ -129,12 +129,21 @@ def fused_rope_ok(x: torch.Tensor, freqs: torch.Tensor, num_heads: int) -> bool:
         and x.dim() == 3
         and x.is_contiguous()
         and freqs.dtype == torch.complex128
-        and freqs.dim() == 3
-        and freqs.shape[0] == x.shape[1]
-        and freqs.shape[1] == 1
-        and x.shape[2] == num_heads * 2 * freqs.shape[2]
         and freqs.device == x.device
-    )
+    ):
+        return False
+    if freqs.dim() == 3:
+        return (
+            freqs.shape[0] == x.shape[1]
+            and freqs.shape[1] == 1
+            and x.shape[2] == num_heads * 2 * freqs.shape[2]
+        )
+    if freqs.dim() == 2:
+        return (
+            freqs.shape[0] == x.shape[1]
+            and x.shape[2] == num_heads * 2 * freqs.shape[1]
+        )
+    return False
 
 
 _STATE = {"checked": False, "enabled": True}
@@ -148,12 +157,13 @@ def rope_apply_auto(x: torch.Tensor, freqs: torch.Tensor, num_heads: int, refere
     """``reference_fn(x, freqs, num_heads)`` (``rope_apply``) through the fused kernel
     when its guards hold. The first call also runs the reference and compares bitwise; on a
     mismatch the fused path is disabled for the process (logged)."""
+    ref_freqs = freqs.unsqueeze(1) if freqs.dim() == 2 else freqs
     if not (_STATE["enabled"] and fused_rope_ok(x, freqs, num_heads)):
-        return reference_fn(x, freqs, num_heads)
+        return reference_fn(x, ref_freqs, num_heads)
     if not _STATE["checked"]:
         _STATE["checked"] = True
         with torch.no_grad():
-            ref = reference_fn(x.detach(), freqs, num_heads)
+            ref = reference_fn(x.detach(), ref_freqs, num_heads)
             out = fused_rope_apply(x.detach(), freqs, num_heads)
             same = torch.equal(ref.view(torch.int16), out.view(torch.int16))
         if not same:
@@ -161,5 +171,5 @@ def rope_apply_auto(x: torch.Tensor, freqs: torch.Tensor, num_heads: int, refere
             import logging
 
             logging.getLogger(__name__).warning("fused RoPE differs from rope_apply on first call; disabled")
-            return reference_fn(x, freqs, num_heads)
+            return reference_fn(x, ref_freqs, num_heads)
     return fused_rope_apply(x, freqs, num_heads)

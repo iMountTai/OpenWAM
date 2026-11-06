@@ -267,6 +267,29 @@ class DualSystemMoTDriver:
             )
 
         s_video = q_v.shape[1]
+        if (
+            enabled("OPENWAM_OPT_MOT_SPLIT_ATTN")
+            and not (self.mot_checkpoint_mixed_attn and ab.training and not suppress_inner_attn_ckpt)
+        ):
+            from openwam.optimizations.attention import separate_attention_plan, split_attention_separate
+
+            plan = separate_attention_plan(attn_mask, s_video, q_a.shape[1])
+            if plan is not None:
+                from openwam.model.video_backbone.wan.models.dit import flash_attention
+
+                k_cat = joint_cat.cat_seq(k_v, k_a)
+                v_cat = joint_cat.cat_seq(v_v, v_a)
+                attn_v, attn_a = run_attention(
+                    split_attention_separate,
+                    q_v, None, None, q_a, None, None,
+                    plan, self.num_heads, flash_attention,
+                    joint_kv=(k_cat, v_cat),
+                    label="mixed_attention",
+                )
+                vstate = vb.post_attn_at_layer(layer_id, vstate, attn_v, vpost)
+                astate = ab.post_attn_at_layer(layer_id, astate, attn_a, apost)
+                return vstate, astate
+
         # torch.cat([x_v, x_a], dim=1); one Triton copy pass with OPENWAM_FAST_CAT=1
         q_cat = joint_cat.cat_seq(q_v, q_a)
         k_cat = joint_cat.cat_seq(k_v, k_a)
@@ -410,6 +433,24 @@ class DualSystemMoTDriver:
         # change: it splits the attention output by query lengths, and SDPA
         # handles the resulting rectangular mask.
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
+
+        if os.environ.get("OPENWAM_CONTEXT_TRUNC", "0") == "1":
+            from torch._dynamo import mark_dynamic
+
+            tensors = (
+                (vstate.context, 1),
+                (vstate.context_mask, -1),
+                (payload.context, 1),
+                (payload.context_mask, -1),
+            )
+            for tensor, dim in tensors:
+                if tensor is not None and getattr(tensor, "ndim", 0) > 1:
+                    axis = dim if dim >= 0 else tensor.ndim + dim
+                    if tensor.shape[axis] > 1 and axis not in getattr(tensor, "_dynamo_dynamic_indices", ()):
+                        try:
+                            mark_dynamic(tensor, axis)
+                        except Exception:
+                            pass
 
         for layer_id in range(self.num_layers):
             if deferred_gather.PENDING is not None:

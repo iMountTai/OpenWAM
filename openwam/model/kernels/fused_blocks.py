@@ -171,11 +171,35 @@ def _wan_pre(x, tmod, modulation, q_w, q_b, k_w, k_b, v_w, v_b, nq_w, nk_w, eps_
     return q, k, v, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
-def _wan_post_a(residual_x, gate_msa, attn_out, o_w, o_b, n3_w, n3_b, cq_w, cq_b, cnq_w, eps3: float, eps_q: float):
+def _wan_post_a(
+    residual_x,
+    gate_msa,
+    attn_out,
+    o_w,
+    o_b,
+    n3_w,
+    n3_b,
+    cq_w,
+    cq_b,
+    cnq_w,
+    eps3: float,
+    eps_q: float,
+    context=None,
+    ck_w=None,
+    ck_b=None,
+    cnk_w=None,
+    cv_w=None,
+    cv_b=None,
+    eps_k: float = 1e-6,
+):
     hs = residual_x + gate_msa * F.linear(attn_out, o_w, o_b)
     h3 = F.layer_norm(hs, (hs.shape[-1],), n3_w, n3_b, eps3)
     cq = _rms(F.linear(h3, cq_w, cq_b), cnq_w, eps_q)
-    return hs, cq
+    if context is None:
+        return hs, cq
+    ck = _rms(F.linear(context, ck_w, ck_b), cnk_w, eps_k)
+    cv = F.linear(context, cv_w, cv_b)
+    return hs, cq, ck, cv
 
 
 def _post_b(hs, cx, co_w, co_b, shift_mlp, scale_mlp, gate_mlp, f1_w, f1_b, f2_w, f2_b, eps2: float, n2_w, n2_b):
@@ -233,7 +257,7 @@ def wan_pre(block, x, time_mod):
 
 def wan_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_out, context, context_mask, attention):
     sa, ca = block.self_attn, block.cross_attn
-    hs, cq = _compiled("wan_post_a", _wan_post_a)(
+    hs, cq, ck, cv = _compiled("wan_post_a", _wan_post_a)(
         residual_x,
         gate_msa,
         attn_out,
@@ -246,11 +270,16 @@ def wan_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
         ca.norm_q.weight,
         float(block.norm3.eps),
         float(ca.norm_q.eps),
+        context,
+        ca.k.weight,
+        ca.k.bias,
+        ca.norm_k.weight,
+        ca.v.weight,
+        ca.v.bias,
+        float(ca.norm_k.eps),
     )
     from openwam.optimizations.sac import active_ffn_boundary, run_attention, run_ffn
 
-    ck = ca.norm_k(ca.k(context))
-    cv = ca.v(context)
     cx = run_attention(attention, cq, ck, cv, ca.num_heads, context_mask, label="video_cross_attention")
 
     if active_ffn_boundary():
@@ -329,7 +358,7 @@ def act_pre(block, x, t_mod):
 def act_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_out, context, text_mask, attention):
     sa, ca = block.self_attn, block.cross_attn
     n = block.context_attn_norm
-    hs, cq = _compiled("act_post_a", _wan_post_a)(
+    hs, cq, ck, cv = _compiled("act_post_a", _wan_post_a)(
         residual_x,
         gate_msa,
         attn_out,
@@ -342,11 +371,16 @@ def act_post(block, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, attn_o
         ca.norm_q.weight,
         float(n.eps),
         float(ca.norm_q.eps),
+        context,
+        ca.k.weight,
+        ca.k.bias,
+        ca.norm_k.weight,
+        ca.v.weight,
+        ca.v.bias,
+        float(ca.norm_k.eps),
     )
     from openwam.optimizations.sac import active_ffn_boundary, run_attention, run_ffn
 
-    ck = ca.norm_k(ca.k(context))
-    cv = ca.v(context)
     cx = run_attention(attention, cq, ck, cv, ca.num_heads, text_mask, label="action_cross_attention")
 
     if active_ffn_boundary():
