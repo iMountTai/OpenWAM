@@ -200,6 +200,42 @@ def test_invalid_preset_prevents_training_start(train_module, monkeypatch, tmp_p
         train_module.main.__wrapped__(_preset_config(preset))
 
 
+def test_cache_entry_applies_preset_before_importing_torch(monkeypatch):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.delenv("OPENWAM_OPT_TEXT_CACHE", raising=False)
+    spec = importlib.util.spec_from_file_location("cache_entry", REPO_ROOT / "scripts/cache_vae_latents.py")
+    cache_entry = importlib.util.module_from_spec(spec)
+    real_import = builtins.__import__
+
+    class ReachedTorch(Exception):
+        pass
+
+    def import_after_preset(name, *args, **kwargs):
+        if name == "torch":
+            assert os.environ["OPENWAM_OPT_TEXT_CACHE"] == "1"
+            assert os.environ["OPENWAM_OPT_VAE_LATENT_CACHE"] == "1"
+            raise ReachedTorch
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_after_preset)
+    spec.loader.exec_module(cache_entry)
+    with pytest.raises(ReachedTorch):
+        cache_entry.main.__wrapped__(_compose("training.speed_preset=presets/hcu_fast_cache.env"))
+
+
+def test_host_async_configures_dataloader_without_online_encoding(train_module, monkeypatch):
+    import accelerate
+
+    monkeypatch.setenv("OPENWAM_OPT_HOST_ASYNC", "1")
+    monkeypatch.setenv("OPENWAM_OPT_ONLINE_ENCODE", "0")
+    monkeypatch.setattr(accelerate, "DeepSpeedPlugin", lambda **_: types.SimpleNamespace(
+        deepspeed_config={"zero_optimization": {"stage": 2}}
+    ))
+    monkeypatch.setattr(accelerate, "Accelerator", lambda **kwargs: kwargs)
+    assert train_module._build_accelerator(_compose())["dataloader_config"].non_blocking
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash launcher testing requires a POSIX environment")
 def test_shell_launcher_defers_preset_and_automatically_selects_gpu_count(tmp_path):
     """The shell must not source a legacy preset before Hydra can disable it."""

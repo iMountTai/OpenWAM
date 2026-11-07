@@ -505,6 +505,9 @@ class OpenWAMTrainer:
                     from accelerate import skip_first_batches
 
                     epoch_iter = skip_first_batches(dataloader, skip_first)
+                    # Accelerate rebuilds the loader without carrying over this setting.
+                    if getattr(dataloader, "_non_blocking", False) and hasattr(epoch_iter, "_non_blocking"):
+                        epoch_iter._non_blocking = True
                 else:
                     epoch_iter = dataloader
                 if online is not None:

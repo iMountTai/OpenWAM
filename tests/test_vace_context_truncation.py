@@ -11,6 +11,7 @@ import pytest
 import torch
 from PIL import Image
 
+from openwam.model.video_backbone.wan import encode as wan_encode
 from openwam.model.video_backbone.wan.models.dit import DiTBlock
 from openwam.model.video_backbone.wan.models.vace import VaceWanModel
 from openwam.model.video_backbone.wan_backbone import Wan21, Wan22Ti2v, _truncate_padded_context
@@ -93,6 +94,38 @@ def _preprocess(bb, prompts):
         text=prompts,
         ref_images=[[clip[0]] for clip in frames],
     )
+
+
+@pytest.mark.parametrize("miss_fast", ["0", "1"])
+@pytest.mark.parametrize("cpu_plan", ["0", "1"])
+def test_vae_first_stages_text_before_video_and_encodes_after(monkeypatch, miss_fast, cpu_plan):
+    monkeypatch.setenv("OPENWAM_VAE_FIRST", "1")
+    monkeypatch.setenv("OPENWAM_TEXT_MISS_FAST", miss_fast)
+    monkeypatch.setenv("OPENWAM_OPT_PADDING_PLAN_CPU", cpu_plan)
+    bb = _make_backbone("ti2v")
+    events = []
+    encode_video = wan_encode.encode_video
+
+    def stage(tensor, device):
+        events.append("stage")
+        return tensor
+
+    def video(*args, **kwargs):
+        events.append("vae")
+        return encode_video(*args, **kwargs)
+
+    monkeypatch.setattr(wan_encode, "_pin_for_device", stage)
+    monkeypatch.setattr(wan_encode, "encode_video", video)
+    bb.text_encoder.register_forward_pre_hook(lambda *_: events.append("t5"))
+    prompts = ["pick up", "close drawer", "pick up"]
+    first = _preprocess(bb, prompts)
+    assert events[-2:] == ["vae", "t5"]
+    assert events[:-2] == ["stage"] * (4 if miss_fast == "1" and cpu_plan == "0" else 3)
+
+    events.clear()
+    second = _preprocess(bb, prompts)
+    assert events == (["stage", "vae"] if cpu_plan == "0" else ["vae"])
+    torch.testing.assert_close(first["context"], second["context"], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("miss_fast", ["0", "1"])

@@ -1,7 +1,8 @@
 """Step 1 of the VAE latent store: encode every RoboTwin training window once.
 
-Use the same dataloader/model overrides and OPENWAM_OPT_* settings as the
-training run, plus the store directory (node-local disk is preferred)::
+Use the same dataloader/model overrides and training.speed_preset as the
+training run, plus the store directory (node-local disk is preferred).
+Use training.speed_preset=null to rely on manually exported switches::
 
     export OPENWAM_VAE_LATENT_CACHE_DIR=/path/to/latents
     torchrun --nproc_per_node=8 scripts/cache_vae_latents.py dataloader=robotwin ... \\
@@ -29,14 +30,13 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-import torch
 from omegaconf import DictConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 
 
-class _Episodes(torch.utils.data.Dataset):
+class _Episodes:
     """All frames of one episode, decoded and assembled once (uint8 [L, H, W, 3]).
 
     Consecutive windows overlap in all but one frame; decoding per window would
@@ -50,6 +50,8 @@ class _Episodes(torch.utils.data.Dataset):
         return len(self.items)
 
     def __getitem__(self, index):
+        import torch
+
         r, e = self.items[index]
         return r, e, torch.from_numpy(_episode_frames(self.readers[r], e))
 
@@ -79,6 +81,8 @@ def _window_pixels(frames, reader, start, dtype, min_value=-1, max_value=1):
     The arithmetic matches preprocess_video's uint8 path; its float32 path gives
     identical values because 0..255 are exact in BF16.
     """
+    import torch
+
     last = frames.shape[0] - 1
     index = torch.tensor([min(start + i, last) for i in reader._video_sample_indices], device=frames.device)
     pixels = frames.index_select(0, index).to(dtype=dtype)
@@ -87,6 +91,8 @@ def _window_pixels(frames, reader, start, dtype, min_value=-1, max_value=1):
 
 
 def _write(path, rows):
+    import torch
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = f"{path}.tmp{os.environ.get('RANK', '0')}"
     with open(temporary, "wb") as handle:
@@ -106,6 +112,12 @@ def _finished(path, rows):
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "configs"), config_name="train")
 def main(cfg: DictConfig) -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
+    from scripts.speed_preset import apply_speed_preset
+
+    apply_speed_preset(cfg, PROJECT_ROOT)
+
+    import torch
+
     from openwam.dataloader.registry import build_dataset
     from openwam.model.video_backbone.wan import encode as wan_encode
     from openwam.optimizations import configure_backends, enabled, prepare_runtime_constants, text_store

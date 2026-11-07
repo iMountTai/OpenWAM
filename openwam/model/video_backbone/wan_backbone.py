@@ -920,7 +920,7 @@ class WanBase(VideoBackbone):
                 "(umT5 runs every iteration without it); ignored"
             )
 
-        def _encode_text():
+        def _encode_text(prepared=None):
             if text_cache is None:  # OPENWAM_TEXT_CACHE off: the default encode
                 ctx, sl = wan_encode.encode_text(
                     text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
@@ -929,10 +929,13 @@ class WanBase(VideoBackbone):
                     max_len = int(sl.max().item()) if isinstance(sl, torch.Tensor) else max(sl)
                     ctx = _truncate_padded_context(ctx, max_len)
                 return ctx, sl
-            text_cache.last_max_len = None  # set by the cached encode path only; None = keep the padded context
-            ctx, sl = wan_encode.encode_text(
-                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device, cache=text_cache
-            )
+            if prepared is None:
+                text_cache.last_max_len = None  # None = keep the padded context
+                ctx, sl = wan_encode.encode_text(
+                    text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device, cache=text_cache
+                )
+            else:
+                ctx, sl = prepared()
             if self._variant.supports_context_truncation:
                 ctx = _truncate_padded_context(ctx, text_cache.last_max_len)
             return ctx, sl
@@ -940,6 +943,11 @@ class WanBase(VideoBackbone):
         video_first = video_latents is None and (
             os.environ.get("OPENWAM_VAE_FIRST", "0") == "1" or getattr(self, "_openwam_video_first", False)
         )
+        prepared_text = None
+        if video_first and text_cache is not None and not has_text_store:
+            prepared_text = wan_encode.prepare_text_cached(
+                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device, cache=text_cache
+            )
         if not video_first:
             context, seq_lens = _encode_text()
 
@@ -964,7 +972,7 @@ class WanBase(VideoBackbone):
             input_latents = input_latents.to(dtype=dtype, device=device)
 
         if video_first:
-            context, seq_lens = _encode_text()
+            context, seq_lens = _encode_text(prepared_text)
 
         # Variant-specific first-frame / control conditioning lives in
         # ``self._variant``, so this method carries no per-variant ``if``.

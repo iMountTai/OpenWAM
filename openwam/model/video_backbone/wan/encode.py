@@ -201,11 +201,9 @@ def _run_encoder(text_encoder, ids, mask, *, device, cache=None):
         offload.release()
 
 
-def _to_device(t: Tensor, device) -> Tensor:
-    """Host-to-device copy without a host sync (through pinned memory) where CUDA is available."""
-    if torch.device(device).type == "cuda":
-        return t.pin_memory().to(device, non_blocking=True)
-    return t.to(device)
+def _pin_for_device(t: Tensor, device) -> Tensor:
+    """Stage host data for a later non-blocking copy."""
+    return t.pin_memory() if torch.device(device).type == "cuda" else t
 
 
 def _encoder_is_frozen_eval(text_encoder) -> bool:
@@ -217,17 +215,20 @@ def _encoder_is_frozen_eval(text_encoder) -> bool:
 
 
 def encode_text_cached(prompts: list, *, tokenizer, text_encoder, device, cache) -> Tuple[Tensor, Tensor]:
-    """``encode_text`` with a :class:`TrainTextEmbedCache` (same outputs, bit for bit).
+    """Encode with a TrainTextEmbedCache."""
+    return prepare_text_cached(prompts, tokenizer=tokenizer, text_encoder=text_encoder, device=device, cache=cache)()
 
-    When every sample of the batch is cached, the rows are stacked; otherwise the
-    encoder runs on the whole batch as in ``encode_text`` and its rows are cached.
-    The padding rows are zeroed with ``masked_fill_`` (the same +0.0 as the
-    per-sample slice assignment of ``encode_text``, without its per-sample host syncs).
+
+def prepare_text_cached(prompts: list, *, tokenizer, text_encoder, device, cache):
+    """Stage host inputs now and return a callable that queues the text work.
+
+    The VAE-first path pins each batch's inputs before queuing video work.
+    PyTorch tracks the non-blocking copies before recycling pinned storage.
     """
     if cache is None or not _encoder_is_frozen_eval(text_encoder):
         if cache is not None:
             cache.clear()
-        return _encode_text_uncached(
+        return lambda: _encode_text_uncached(
             prompts, tokenizer=tokenizer, text_encoder=text_encoder, device=device, cache=cache
         )
     ids, mask = tokenizer(
@@ -244,66 +245,69 @@ def encode_text_cached(prompts: list, *, tokenizer, text_encoder, device, cache)
     keys = [(ids[i].numpy().tobytes(), mask[i].numpy().tobytes()) for i in range(ids.shape[0])]
     seq_lens_cpu = mask.gt(0).sum(dim=1).long()
     cache.last_max_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 0
-    seq_lens = seq_lens_cpu if cpu_plan else _to_device(seq_lens_cpu, device)
+    seq_lens_host = seq_lens_cpu if cpu_plan else _pin_for_device(seq_lens_cpu, device)
     rows = [cache.get(k) for k in keys]
     n = cache.hits + cache.misses + 1
     if n & (n - 1) == 0 and os.environ.get("RANK", "0") == "0":
         logger.info(
             "text-embed cache: call %d, hits %d, misses %d, entries %d", n, cache.hits, cache.misses, len(cache.rows)
         )
-    if all(r is not None for r in rows):
-        cache.hits += 1
-        return torch.stack(rows, dim=0), seq_lens
-    cache.misses += 1
-    if os.environ.get("OPENWAM_TEXT_MISS_FAST", "0") == "1":
-        return _encode_misses(
-            ids, mask, keys, rows, seq_lens_cpu, seq_lens, text_encoder=text_encoder, device=device, cache=cache
+    hit = all(row is not None for row in rows)
+    miss = None
+    if not hit:
+        full_len = ids.shape[1]
+        if os.environ.get("OPENWAM_TEXT_MISS_FAST", "0") == "1":
+            # Only encode distinct misses on a prefix rounded up to 64 tokens.
+            miss_by_key = {}
+            for i, (key, row) in enumerate(zip(keys, rows)):
+                if row is None:
+                    miss_by_key.setdefault(key, i)
+            miss = list(miss_by_key.values())
+            lengths = seq_lens_cpu[miss]
+            width = min(full_len, max(64, ((int(lengths.max()) + 63) // 64) * 64))
+            ids_host = _pin_for_device(ids[miss, :width].contiguous(), device)
+            mask_host = _pin_for_device(mask[miss, :width].contiguous(), device)
+            lengths_host = _pin_for_device(lengths, device)
+        else:
+            ids_host = _pin_for_device(ids, device)
+            mask_host = _pin_for_device(mask, device)
+            lengths_host = _pin_for_device(seq_lens_cpu, device) if cpu_plan else seq_lens_host
+
+    def encode():
+        seq_lens = seq_lens_host if cpu_plan else seq_lens_host.to(device, non_blocking=True)
+        if hit:
+            cache.hits += 1
+            return torch.stack(rows, dim=0), seq_lens
+        cache.misses += 1
+        context = _run_encoder(
+            text_encoder,
+            ids_host.to(device, non_blocking=True),
+            mask_host.to(device, non_blocking=True),
+            device=device,
+            cache=cache,
         )
-    context = _run_encoder(text_encoder, _to_device(ids, device), _to_device(mask, device), device=device, cache=cache)
-    sl_dev = _to_device(seq_lens_cpu, context.device) if cpu_plan else seq_lens
-    pad = torch.arange(context.shape[1], device=context.device).unsqueeze(0) >= sl_dev.unsqueeze(1)
-    context.masked_fill_(pad.unsqueeze(-1), 0)
-    for i, k in enumerate(keys):
-        if cache.get(k) is None:
-            cache.put(k, context[i].clone())
-    return context, seq_lens
+        if miss is None and not cpu_plan:
+            lengths_device = seq_lens
+        else:
+            lengths_device = lengths_host.to(context.device, non_blocking=True)
+        pad = torch.arange(context.shape[1], device=context.device).unsqueeze(0) >= lengths_device.unsqueeze(1)
+        context.masked_fill_(pad.unsqueeze(-1), 0)
+        if miss is None:
+            for i, key in enumerate(keys):
+                if cache.get(key) is None:
+                    cache.put(key, context[i].clone())
+            return context, seq_lens
 
+        if context.shape[1] < full_len:
+            context = torch.nn.functional.pad(context, (0, 0, 0, full_len - context.shape[1]))
+        new_rows = {}
+        for j, i in enumerate(miss):
+            row = context[j].clone()
+            new_rows[keys[i]] = row
+            cache.put(keys[i], row)
+        return torch.stack([row if row is not None else new_rows[key] for row, key in zip(rows, keys)]), seq_lens
 
-def _encode_misses(ids, mask, keys, rows, seq_lens_cpu, seq_lens, *, text_encoder, device, cache):
-    """Cache-miss path with ``OPENWAM_TEXT_MISS_FAST=1``: run the frozen umT5 only on the distinct
-    prompts of the batch that are not cached yet, on their token prefix padded to a multiple of 64
-    instead of 512.
-
-    The same function per row: the encoder's rows are independent (per-row GEMMs, per-row attention),
-    padded keys get ``finfo.min`` before the fp32 softmax (weight exactly 0) and the relative position
-    bias depends only on i - j, so the outputs at the valid positions do not depend on how much padding
-    follows; positions >= seq_len are zeroed and the row is zero-padded back to 512. The GEMMs run with
-    other shapes, so rounding can differ from a full-batch 512-token encode. Rows are cached as on the
-    full-batch path.
-    """
-    miss, seen = [], set()
-    for i, k in enumerate(keys):
-        if rows[i] is None and k not in seen:
-            seen.add(k)
-            miss.append(i)
-    full_len = ids.shape[1]
-    sl = seq_lens_cpu[miss]
-    L = min(full_len, max(64, ((int(sl.max()) + 63) // 64) * 64))
-    sub_ids = _to_device(ids[miss, :L].contiguous(), device)
-    sub_mask = _to_device(mask[miss, :L].contiguous(), device)
-    out = _run_encoder(text_encoder, sub_ids, sub_mask, device=device, cache=cache)
-    sl_d = _to_device(sl, device)
-    pad = torch.arange(L, device=out.device).unsqueeze(0) >= sl_d.unsqueeze(1)
-    out.masked_fill_(pad.unsqueeze(-1), 0)
-    if L < full_len:
-        out = torch.nn.functional.pad(out, (0, 0, 0, full_len - L))
-    new_rows = {}
-    for j, i in enumerate(miss):
-        row = out[j].clone()
-        new_rows[keys[i]] = row
-        cache.put(keys[i], row)
-    context = torch.stack([r if r is not None else new_rows[k] for r, k in zip(rows, keys)], dim=0)
-    return context, seq_lens
+    return encode
 
 
 def encode_text_for_inference(
